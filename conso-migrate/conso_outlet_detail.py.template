@@ -1,0 +1,150 @@
+import scrapy
+import logging
+
+from {{ID_PLATFORM}}.items import OutletItem, MealItem, OptionItem, RelationItem
+from dashmote_sourcing.spiders.spider_template import BaseSpider
+
+
+class ConSoOutletDetail(BaseSpider):
+    name = "conso_outlet_detail"
+    id_platform = "{{ID_PLATFORM}}"
+
+    custom_settings = {
+        "ITEM_PIPELINES": {
+            'dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline': 100,
+            'dashmote_sourcing.pipelines.s3_pipeline.S3Pipeline': 400,
+            # 'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 400, # for testing
+        },
+        "DOWNLOADER_MIDDLEWARES": {
+            'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 543,
+        },
+        "LOG_LEVEL": "INFO",
+    }
+
+    def __init__(
+            self, prefix, output_month=None,
+            recrawl=True, id_refresh=True,
+            *args, **kwargs
+        ):
+        super().__init__(**kwargs)
+
+        self.prefix = prefix
+        self.recrawl = self._validate_bool_param(recrawl, 'recrawl')
+        self.id_refresh = self._validate_bool_param(id_refresh, 'id_refresh')
+
+
+    def start_requests(self):
+        # ── Step 1: filter() ─────────────────────────────────────────────────
+        # Replaces all manual data-loading and dedup logic from the source project.
+        # Calling with no arguments works for most platforms and is the default.
+        # Only pass explicit parameters when the source project's logic requires it —
+        # choose based on what you observed during Phase 0.1 analysis:
+        #
+        #   MySQL with custom query (source filtered rows manually before queuing):
+        #     self.filter(
+        #         read_sql={'db_name': self.id_platform,
+        #                   'query': 'SELECT id_outlet FROM US WHERE active = 1'},
+        #         recrawl=self.recrawl,
+        #     )
+        #
+        #   Google Sheets (source read a GSheet as input list):
+        #     self.filter(
+        #         read_gsheet={'sheet_id': '...', 'sheet_title': 'Sheet1'},
+        #         recrawl=self.recrawl,
+        #     )
+        #
+        #   S3 file (source read a parquet / csv / xlsx / jsonl from S3):
+        #     self.filter(
+        #         read_inputfile={'s3_uri': 's3://dash-dbcenter/.../data.parquet'},
+        #         recrawl=self.recrawl,
+        #     )
+        #
+        # Fix modes — use when source project had补爬 / gap-fill logic:
+        #   meal_fix  → outlets whose meal data is absent from S3:
+        #     self.filter(meal_fix=True)
+        #
+        #   option_fix → meals whose option data is absent from S3 (queue value is JSON):
+        #     self.filter(option_fix=True)
+        #     # pop loop: use json.loads() on the value; extract id_outlet + id_meal.
+        #
+        self.filter(recrawl=self.recrawl)
+
+        # ── Step 2: load_metadata() ──────────────────────────────────────────
+        # Replaces per-outlet DB / file lookups the source project did inside
+        # parse callbacks. Loaded once, cached in memory, accessed via get_metadata().
+        #
+        # No-argument call (recommended) — zero overhead, reuses filter()'s DataFrame.
+        # Works for most platforms. Only pass explicit parameters when observed
+        # source logic requires metadata from a different or additional source:
+        #
+        #   Extra columns not in filter()'s source, or a different table:
+        #     self.metadata = self.load_metadata(
+        #         read_sql={'db_name': self.id_platform, 'prefix': 'extra_table'},
+        #         required_columns=['lat', 'lon', 'name'],  # raises ValueError if absent
+        #     )
+        #
+        #   option_fix with dual metadata (outlet + meal):
+        #     self.meal_metadata   = self.load_metadata(
+        #         read_inputfile={'s3_uri': 's3://dash-dbcenter/.../meals.parquet'},
+        #         index_column='id_meal',
+        #     )
+        #     self.outlet_metadata = self.load_metadata()   # reuses filter() cache
+        self.metadata = self.load_metadata()
+
+        total_tasks = self.redis_client.count_unique_tasks(self.db_key)
+        logging.info(f"Found {total_tasks} tasks in {self.prefix}.")
+
+        self.crawler.stats.set_value("country", self.prefix)
+        self.crawler.stats.set_value("spider", self.name)
+        self.crawler.stats.set_value("id_platform", self.id_platform)
+
+        logging.info("Start sourcing...")
+        while self.redis_client.count_set(self.db_key):
+            id_outlet = self.redis_client.pop_from_set(self.db_key)
+
+            if outlet_data := self.get_metadata(id_outlet):
+                # [PORT YOUR REQUEST LOGIC HERE]
+                # Replace the URL, headers, body and method to match the platform API.
+                yield scrapy.Request(
+                    url=...,
+                    callback=self.parse,
+                    meta={"id_outlet": id_outlet, "outlet_data": outlet_data},
+                )
+
+    # ------------------------------------------------------------------ #
+    # Add further requests methods here for multi-request chains,        #
+    # e.g. def start_meal_requests(self, id_outlet): ...                 #
+    # ------------------------------------------------------------------ #
+
+
+    def parse(self, response):
+        # [PORT YOUR PARSE LOGIC HERE]
+        # Port each request sub-chain as a separate callback method below.
+        #
+        # Example pattern:
+        #   data = response.json()
+        # 
+        #   outlet = OutletItem()
+        #
+        #   outlet['id_outlet'] = response.meta['id_outlet']
+        #   outlet['name'] = data.get('name')
+        #   outlet['platform'] = self.id_platform
+        #
+        #   yield outlet
+        #
+        #   for raw in data.get('menu', []):
+        #       meal = MealItem()
+        #
+        #       meal['id_outlet'] = response.meta['id_outlet']
+        #       meal['id_meal'] = raw.get('id') or str(uuid.uuid5(...))
+        #       meal['name'] = raw.get('name')
+        #       meal['platform'] = self.id_platform
+        #
+        #       yield meal
+        ...
+
+
+    # ------------------------------------------------------------------ #
+    # Add further parse methods here for multi-request chains,           #
+    # e.g. def parse_meals(self, response): ...                          #
+    # ------------------------------------------------------------------ #

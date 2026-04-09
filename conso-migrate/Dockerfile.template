@@ -1,0 +1,8 @@
+FROM 593453040104.dkr.ecr.eu-central-1.amazonaws.com/dashmote-sourcing:latest
+
+WORKDIR /app
+ADD {{ID_PLATFORM}} {{ID_PLATFORM}}
+ADD scrapy.cfg scrapy.cfg
+
+COPY . .
+WORKDIR /app/{{ID_PLATFORM}}/spiders

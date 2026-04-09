@@ -1,0 +1,58 @@
+# Scrapy settings for {{ID_PLATFORM}} project
+
+PLATFORM = '{{ID_PLATFORM}}'
+PLATFORM_NAME = '{{PLATFORM_NAME}}'
+
+BOT_NAME = PLATFORM
+
+SPIDER_MODULES = [f"{BOT_NAME}.spiders"]
+NEWSPIDER_MODULE = f"{BOT_NAME}.spiders"
+
+LOG_LEVEL = 'INFO'
+
+ROBOTSTXT_OBEY = False
+COOKIES_ENABLED = False
+
+HTTPERROR_ALLOWED_CODES = [404]
+
+
+# MongoDBPipeline Settings (local testing only)
+# To enable: comment out ITEM_PIPELINES in custom_settings of the spider you want to test.
+# To disable: uncomment ITEM_PIPELINES in custom_settings.
+from {{ID_PLATFORM}}.items import (
+    FeedItem,
+    OutletItem,
+    MealItem,
+    OptionItem,
+    RelationItem,
+)
+
+MONGODB_URI = 'mongodb://localhost:27017'
+MONGO_DB = PLATFORM_NAME
+MONGODB_ITEM_MAPPINGS = {
+    'outlets':            FeedItem,
+    'outlet_information': OutletItem,
+    'outlet_meal':        MealItem,
+    'meal_option':        OptionItem,
+    'option_relation':    RelationItem,
+}
+
+MONGODB_BUFFER_SIZES = {
+    'outlets':            50,
+    'outlet_information': 50,
+    'outlet_meal':        500,
+    'meal_option':        1000,
+    'option_relation':    1000,
+}
+
+MONGODB_UNIQUE_KEYS = {
+    'outlet_information': ['id_outlet'],
+    'outlet_meal':        ['id_meal', 'id_category', 'id_outlet'],
+    'meal_option':        ['id_option', 'id_category', 'id_meal', 'id_outlet'],
+    'option_relation':    ['id_option', 'id_category', 'id_meal', 'id_outlet'],
+}
+
+
+REQUEST_FINGERPRINTER_IMPLEMENTATION = '2.7'
+TWISTED_REACTOR = 'twisted.internet.asyncioreactor.AsyncioSelectorReactor'
+FEED_EXPORT_ENCODING = 'utf-8'

@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "{{ID_PLATFORM}}"
+version = "1.0.0"
+description = "Scrapy Project (ConSo) for {{PLATFORM_NAME}} ({{ID_PLATFORM}})"
+authors = ["{{MAINTAINER_EMAIL}}"]
+maintainers = ["{{MAINTAINER_EMAIL}}"]
+repository = "https://github.com/{{GITHUB_ORG}}/{{ID_PLATFORM}}.git"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+dashmote-sourcing = {git = "ssh://git@github.com/{{GITHUB_ORG}}/dashmote_sourcing.git", branch = "feature/conso"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

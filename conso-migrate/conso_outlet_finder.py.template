@@ -1,0 +1,93 @@
+import scrapy
+import logging
+
+from {{ID_PLATFORM}}.items import FeedItem
+from {{ID_PLATFORM}}.settings import PLATFORM
+from dashmote_sourcing.spiders.spider_template import BaseSpider
+
+
+class ConSoOutletFinder(BaseSpider):
+    name = "conso_outlet_finder"
+    id_platform = PLATFORM
+
+    custom_settings = {
+        "DUPEFILTER_CLASS": "scrapy.dupefilters.BaseDupeFilter",
+        "ITEM_PIPELINES": {
+            'dashmote_sourcing.pipelines.mysql_pipeline.RDSPipeline': 300,
+            # 'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 300,  # for testing — enable alongside RDSPipeline, NOT instead of it
+        },
+        "DOWNLOADER_MIDDLEWARES": {
+            'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 100,
+        },
+    }
+
+    def __init__(self, prefix, *args, **kwargs):
+        super().__init__(**kwargs)
+
+        self.prefix = prefix
+        self.grid_name = kwargs.get('grid_name', prefix)
+        self.db_key = f'{self.id_platform}:{self.prefix}:{self.grid_name}'
+
+
+    def start_requests(self):
+        first_grid = self.redis_client.pop_and_push_grid(self.db_key)
+        total_grids = self.redis_client.count_sorted_set(self.db_key)
+        logging.info(f'Found {total_grids} grids in total.')
+
+        logging.info('Start sourcing...')
+        while self.redis_client.count_sorted_set(self.db_key):
+            grid_str = self.redis_client.pop_and_push_grid(self.db_key)
+            self.redis_client.check_round(grid_str, first_grid)
+
+            # [GENERATE GRID PARSING LOGIC HERE]
+            # Based on the grid format observed in push_grids.py CONFIGS,
+            # generate the parsing logic inline — it must exactly match `fields`.
+            # On malformed records assign grid = None and use `continue` to skip.
+            #
+            # lat,lon (standard_grid):
+            #   lat, lon = grid_str.split(',')
+            #   grid = {'lat': lat, 'lon': lon}
+            #
+            # lat,lon,google_place_id:
+            #   lat, lon, google_place_id = grid_str.split(',')
+            #   grid = {'lat': lat, 'lon': lon, 'google_place_id': google_place_id}
+            #
+            # area (id,name,slug,cityId,cityName,lat,lng):
+            #   parts = ['' if p == 'None' else p for p in grid_str.split(',')]
+            #   try:
+            #       grid = {'id': parts[0], 'name': parts[1], 'slug': parts[2],
+            #               'id_city': parts[3], 'city': parts[4], 'lat': parts[5], 'lon': parts[6]}
+            #   except IndexError:
+            #       logging.error(f"Malformed grid record: '{grid_str}'")
+            #       continue
+            #
+            # postcode (bare string):
+            #   grid = {'postcode': grid_str}
+            #
+            # address (city,state,state_name,lat,lon,zip,address):
+            #   parts = grid_str.split(',')
+            #   grid = {'city': parts[0], 'state': parts[1], 'state_name': parts[2],
+            #           'lat': parts[3], 'lon': parts[4], 'zip': parts[5], 'address': parts[6]}
+
+            # [PORT YOUR REQUEST LOGIC HERE]
+            # Use grid fields (e.g. grid['lat'], grid['lon']) to construct the API call.
+            yield scrapy.Request(
+                url=...,
+                callback=self.parse,
+                meta={'grid': grid},
+            )
+
+
+
+
+    def parse(self, response):
+        # [PORT YOUR PARSE LOGIC HERE]
+        # Yield one FeedItem per discovered outlet.
+        # id_outlet is required; generate with uuid5 if the platform provides no stable ID.
+        #
+        # Example pattern:
+        #   for raw in data['restaurants']:
+        #       item = FeedItem()
+        #       item['id_outlet'] = raw.get('id') or str(uuid.uuid5(...))
+        #       yield item
+        ...

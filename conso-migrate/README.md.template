@@ -1,0 +1,157 @@
+# ACM - AcmeEats Scrapy Project (ConSo)
+
+Scrapy project for scraping restaurant listings and menu data from AcmeEats,
+covering United States and Canada. Collects outlet information, meal items,
+and meal options via the AcmeEats mobile API.
+
+> **Branch:** This repository runs on the `feature/conso` branch, which depends on
+> `dashmote_sourcing@feature/conso` and deploys via GitHub Actions → ECR → ECS Fargate.
+
+## Overview
+
+**Platform:** ACM<br>
+**Platform Name:** AcmeEats<br>
+**Official Website:** [acmeeats.com](https://www.acmeeats.com)<br>
+
+**Service Availability:** 🇺🇸 United States (US), 🇨🇦 Canada (CA)<br>
+**Supported Devices:** Mobile
+
+### ConSo Architecture
+
+This project runs two spiders in sequence:
+
+1. **`conso_outlet_finder`** — Iterates over geo-grid points (lat/lon) from Redis and
+   calls the AcmeEats search API to discover restaurant IDs near each point. Discovered
+   outlets are written to MySQL via `RDS_PIPELINE`.
+
+2. **`conso_outlet_detail`** — Reads outlet IDs from MySQL, fetches full restaurant
+   detail (name, address, hours) and menu data (meals + options) in a two-step request
+   chain. Output is written to S3 as Parquet via `S3_PIPELINE`.
+
+### API Information
+
+| Name | Method | Type | Platform | Spider | Auth | Proxy | Description |
+|------|--------|------|----------|--------|:-----|:------|:------------|
+| Search Nearby | GET | API | Mobile | finder | Bearer | Yes | Discover restaurants near a lat/lon grid point |
+| Restaurant Detail | GET | API | Mobile | detail | Bearer | Yes | Fetch name, address, coordinates, hours, and ratings |
+| Menu | GET | API | Mobile | detail | Bearer | Yes | Fetch full menu tree (categories → meals → options) |
+
+### Request Flow Diagram
+
+```mermaid
+graph TD
+    A[start_requests<br/>pop grid from Redis] -->|lat, lon| B[parse<br/>search API]
+    B -->|id_outlet, country| C[FeedItem → MySQL]
+
+    D[start_requests<br/>pop id_outlet from Redis] -->|id_outlet, outlet_data| E[_build_request<br/>detail API]
+    E --> F[parse<br/>outlet_information]
+    F -->|id_outlet| G[parse_menu<br/>menu API]
+    G --> H[OutletItem → S3]
+    G --> I[MealItem × N → S3]
+    I -->|id_meal| J[OptionItem × M → S3]
+```
+
+### Important Notes
+
+1. **Bearer token rotation:** The mobile API requires a short-lived Bearer token
+   obtained from the `/auth/token` endpoint using a device fingerprint. Token refresh
+   is handled inside `_get_token()` and cached per spider instance.
+2. **Menu pagination:** The menu API returns up to 50 items per page. `parse_menu`
+   follows `nextPageToken` until exhausted.
+3. **Closed restaurants:** Outlets with `"status": "CLOSED_PERMANENTLY"` are yielded
+   with `closed=True` and no menu requests are made — reduces wasted requests by ~8%.
+
+---
+
+## Project Configuration
+
+This project contains 2 spiders:
+
+1. **`conso_outlet_finder`** — geo-grid based restaurant discovery
+2. **`conso_outlet_detail`** — restaurant detail + menu collection
+
+### Spider Parameters (`-a` arguments)
+
+#### `conso_outlet_finder` args:
+
+| Parameter | Required | Default | Description |
+|:----------|:---------|:--------|:------------|
+| `prefix` | Yes | — | 2-char country code (e.g. `US`) |
+| `grid_name` | No | same as `prefix` | Redis key suffix override |
+| `local_test` | No | `False` | Use test Redis; skip prod writes |
+| `sample` | No | `0` | Close spider after N items (`0` = production) |
+
+#### `conso_outlet_detail` args:
+
+| Parameter | Required | Default | Description |
+|:----------|:---------|:--------|:------------|
+| `prefix` | Yes | — | 2-char country code (e.g. `US`) |
+| `output_month` | Yes | — | S3 partition month in `YYYYMM` format |
+| `recrawl` | No | `True` | Re-crawl already-seen outlets |
+| `id_refresh` | No | `True` | Refresh Redis queue from MySQL |
+| `local_test` | No | `False` | Use test Redis and `s3://dash-alpha-dev` |
+| `sample` | No | `0` | Close spider after N items (`0` = production) |
+
+---
+
+## Setup and Usage
+
+### 1. Push Grids
+
+Populate the Redis grid queue before running the finder spider:
+
+```bash
+poetry run python scripts/push_grids.py
+```
+
+Grid files are read from `s3://dash-dbcenter/config/acmeeats/` (one JSON per prefix).
+The script pushes to test Redis, then copies to prod Redis via SSM → EC2.
+
+### 2. Run Locally
+
+Always run finder before detail — detail's `filter()` reads outlet IDs seeded by the finder.
+
+```bash
+# Step 1 — Finder: discover 1 outlet and write to MySQL
+scrapy crawl conso_outlet_finder -a prefix=US -a local_test=True \
+    -s CLOSESPIDER_ITEMCOUNT=1
+
+# Step 2 — Detail: process 1 outlet (outlet_information + meals + options), then stop
+scrapy crawl conso_outlet_detail -a prefix=US -a output_month=202503 \
+    -a sample=1 -a local_test=True
+```
+
+### 3. Production Deploy
+
+Push to `feature/conso` to trigger the CI/CD pipeline:
+
+```
+push to feature/conso (this repo)
+  → .github/workflows/ECR.yml
+  → platform.yml (dashmote-sourcing repo)
+  → Docker build FROM dashmote-sourcing:latest
+  → push conso_acm_spider to ECR
+  → ECS task definition updated
+```
+
+---
+
+## Data Schema
+
+### Output Items
+
+| Table | Stored In | Key Fields |
+|-------|-----------|------------|
+| `outlets` | MySQL (RDS Pipeline) | `id_outlet`, `country` |
+| `outlet_information` | S3 Parquet | `id_outlet`, `name`, `address`, `lat`, `lon`, `rating`, `cuisine`, `opening_hours` |
+| `outlet_meal` | S3 Parquet | `id_outlet`, `id_meal`, `id_category`, `name`, `price`, `sold_out` |
+| `meal_option` | S3 Parquet | `id_outlet`, `id_option`, `name`, `price` |
+
+> Tables collected by this platform: `outlet_information`, `outlet_meal`, `meal_option`
+
+### Supported Countries
+
+| Prefix | Country |
+|--------|---------|
+| US | United States |
+| CA | Canada |
