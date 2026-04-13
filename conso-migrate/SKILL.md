@@ -1,3 +1,10 @@
+---
+name: conso-migrate
+description: "ConSo Migration Assistant. Migrate any crawler/scraper to ConSo standard end-to-end. Trigger words: conso, migrate, migration, spider, ConSo standard."
+disable-model-invocation: true
+allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
+---
+
 # ConSo Migration Assistant
 
 Migrate ANY kind of crawler/scraper to ConSo standard end-to-end with maximum automation.
