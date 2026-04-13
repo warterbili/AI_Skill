@@ -1,0 +1,17 @@
+# Claude Code local settings (user-specific, must not be committed)
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tmp
+*.swp
+*~

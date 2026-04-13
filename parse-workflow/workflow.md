@@ -1,32 +1,185 @@
 # Standard Parse Workflow
 
 > Step-by-step execution guide for the AI agent.
-> Strictly execute Phase 0 through Phase 6 in order. Phase 0.5 (Resume Detection) may skip ahead to a later Phase if prior progress is detected.
+> Strictly execute Phase 0 → 0.5 → (1) → 2 → 3 → (Pre-Phase 3 Gate) → 4 → (Pre-Phase 5 Gate) → 5 → 6 in order.
+> Phase 0.5 (Resume Detection) may skip ahead. Phase 1 + parts of Phase 2 are skipped in **UPDATE mode**.
+
+---
+
+## Mode-aware Flow Summary
+
+| Mode | When | Phases run |
+|------|------|-----------|
+| **NEW** | Brand new platform — no MySQL DB, no `handoff.json`, no state file | Phase 0 → 0.5 → 1 → 2 → 3 → Pre-Phase 3 Gate → 4 → Pre-Phase 5 Gate → 5 → 6 (full flow) |
+| **UPDATE** | Platform already migrated — MySQL DB exists OR `handoff.json` exists | Phase 0 → 0.5 → ~~1~~ → 2 (limited to changed endpoints — ask user which) → 3 → Pre-Phase 3 Gate → 4 → Pre-Phase 5 Gate → 5 → 6 |
+
+Mode is detected automatically in **Phase 0 Step 0.1.7**. The user may override.
+
+When in UPDATE mode:
+- Phase 1 is **skipped** — the prior `doc/project_analysis_summary.md` is still
+  valid (we trust prior work; if anti-scraping changed, the user should say so).
+- Phase 2 is **scoped** — ask the user "which endpoint(s) need re-testing?"
+  Then re-test only those. Other endpoints' analysis docs remain authoritative.
+- Phase 3-6 run normally — re-write only the parse functions for changed endpoints.
 
 ---
 
 ## Phase 0: Initialization
 
-### Step 0.1: Collect User Input (single prompt)
+### Step 0.1: Collect User Input (parse args first, ask only for missing)
 
-Ask for all required information in a single prompt — **do not split into multiple questions**:
+The skill's `argument-hint` accepts up to 5 positional args:
+`[platform-name] [work-dir] [reverse-project-path] [platform-id] [country]`
+
+**Procedure:**
+
+1. **Parse `$ARGUMENTS`** — assign positional args to variables in order. Any
+   trailing missing slots stay empty.
+2. **Run Step 0.1.5 (Proactive preflight)** — this can fill in `platform_id`
+   from MySQL and may suggest `platform_name` from `reverse_path` basename.
+3. **After preflight**, look at what's still missing. Ask only for THOSE in a
+   single prompt, showing detected defaults in `[brackets]` so user can
+   accept by hitting Enter.
+
+Example prompt when only `platform_id` and `country` are missing:
 
 ```
-Hello! Parse workflow started. Please provide the following information:
+Detected:
+  platform_name:  ifood        (from reverse_path basename + Preflight)
+  reverse_path:   /home/user/sourcing-cracked/ifood-web
+  work_dir:       /home/user/IFD_fields
+  platform_id:    [Preflight could not query MySQL — please provide]
+  country:        [missing — please provide]
 
-1. Working directory (where code and results will be output)
-   Example: /home/user/IFD_fields
-
-2. Reverse-engineered project local path (where the completed reverse-engineered code is)
-   Example: /home/user/sourcing-cracked/ifood-web
-
-3. Platform information:
-   - Platform name (lowercase English, e.g. ifood, ubereats, deliveroo)
-   - Platform ID (internal number, e.g. "1")
-   - Target country code (e.g. BR, GB, US)
+Provide platform_id (e.g. "1") and country (2-letter code, e.g. BR):
 ```
 
-Wait for the user to reply with all information before continuing.
+If `$ARGUMENTS` is empty AND preflight detected nothing, fall back to the
+original 5-field prompt.
+
+### Step 0.1.5: Proactive Preflight (MySQL early-binding + cross-skill state)
+
+Before asking the user, do everything we can to fill in defaults silently.
+
+**Why this exists:** historically Step 3.1.5 queries MySQL for `ID_PLATFORM`
+and finder schema, but Phase 3 is way too late — by then the user has already
+told us a (potentially wrong) `platform_id`. Doing the query in Phase 0 means
+we can **auto-fill `platform_id`** for existing platforms.
+
+```bash
+# Set up — needs $REVERSE_PATH (from args) and $DETECTED_PLATFORM (from SKILL.md preflight)
+PLATFORM_GUESS="${PLATFORM_GUESS:-$DETECTED_PLATFORM}"
+
+# ---- A. Query MySQL for matching platform (early-binding) ----
+# Don't fail the whole skill if MySQL is unreachable — narrate, fall back.
+MYSQL_DISCOVERY=$(python3 << PYEOF 2>&1
+import json, sys
+try:
+    import boto3, pymysql
+    s3 = boto3.client('s3', region_name='eu-central-1')
+    obj = s3.get_object(Bucket='dash-dbcenter', Key='config/general_config/config.json')
+    cfg = json.loads(obj['Body'].read())
+    conn = pymysql.connect(
+        host=cfg['host'], user=cfg['user'], password=cfg['passwd'],
+        port=3306, connect_timeout=5,
+    )
+    cur = conn.cursor()
+    # Find the database whose name (case-insensitive) matches our platform guess
+    cur.execute("SHOW DATABASES")
+    dbs = [r[0] for r in cur.fetchall()]
+    guess = "${PLATFORM_GUESS}".upper()
+    matched = next((d for d in dbs if d.upper() == guess or d.lower() == guess.lower()), None)
+
+    out = {"mysql_available": True, "matched_db": matched, "candidates": dbs[:50]}
+
+    if matched:
+        cur.execute(f"USE `{matched}`")
+        cur.execute("SHOW TABLES")
+        tables = [r[0] for r in cur.fetchall()]
+        out["tables"] = tables[:20]
+        if tables:
+            cur.execute(f"DESCRIBE `{tables[0]}`")
+            out["finder_schema"] = [
+                {"field": r[0], "type": r[1], "null": r[2]}
+                for r in cur.fetchall()
+            ]
+    conn.close()
+    print(json.dumps(out))
+except Exception as e:
+    print(json.dumps({"mysql_available": False, "error": str(e)[:200]}))
+PYEOF
+)
+
+echo "$MYSQL_DISCOVERY" > "$STATE_DIR/mysql_discovery_${PLATFORM_GUESS:-unknown}.json"
+
+# Parse for downstream Phase 0 + Phase 3
+MYSQL_OK=$(echo "$MYSQL_DISCOVERY" | jq -r '.mysql_available')
+MATCHED_DB=$(echo "$MYSQL_DISCOVERY" | jq -r '.matched_db // empty')
+
+if [[ "$MYSQL_OK" == "true" && -n "$MATCHED_DB" ]]; then
+    echo "✅ MySQL: platform '$MATCHED_DB' EXISTS — UPDATE-mode candidate"
+    # ID_PLATFORM is the MySQL DB name (uppercase platform code)
+    # Phase 3.1.5 will skip its re-query and reuse this discovery
+elif [[ "$MYSQL_OK" == "true" ]]; then
+    echo "ℹ️  MySQL reachable but no DB matches '$PLATFORM_GUESS' — NEW-mode candidate"
+else
+    ERR=$(echo "$MYSQL_DISCOVERY" | jq -r '.error')
+    echo "⚠️  MySQL unreachable ($ERR) — Phase 3.1.5 will retry; user must provide platform_id manually"
+fi
+
+# ---- B. Read sibling skill state for cross-skill awareness ----
+for sibling in conso-migrate run-detail id-refresh; do
+    if [[ -d "$HOME/.claude/state/$sibling" ]]; then
+        match=$(ls "$HOME/.claude/state/$sibling/${PLATFORM_GUESS}"*.json 2>/dev/null | head -1)
+        [[ -n "$match" ]] && echo "  cross-skill: $sibling has state for $PLATFORM_GUESS"
+    fi
+done
+```
+
+### Step 0.1.7: Mode Detection (NEW vs UPDATE)
+
+```bash
+MODE="NEW"
+REASONS=()
+
+# Signal 1: handoff.json exists in work_dir
+if [[ -f "$WORK_DIR/handoff.json" ]]; then
+    MODE="UPDATE"
+    REASONS+=("handoff.json present in $WORK_DIR")
+fi
+
+# Signal 2: MySQL has the platform DB
+if [[ "$MYSQL_OK" == "true" && -n "$MATCHED_DB" ]]; then
+    MODE="UPDATE"
+    REASONS+=("MySQL DB '$MATCHED_DB' exists")
+fi
+
+# Signal 3: state file exists
+if [[ -f "$STATE_DIR/${PLATFORM_GUESS}.json" ]]; then
+    LAST_STEP=$(jq -r '.last_step // "?"' "$STATE_DIR/${PLATFORM_GUESS}.json")
+    REASONS+=("state file present (last_step: $LAST_STEP)")
+    # state file alone doesn't force UPDATE — could be a half-finished NEW run
+fi
+
+echo ""
+echo "🎯 Mode: $MODE"
+for r in "${REASONS[@]}"; do echo "    • $r"; done
+
+if [[ "$MODE" == "UPDATE" ]]; then
+    echo ""
+    echo "    UPDATE mode:"
+    echo "    - Phase 1 (analyze project)        → SKIPPED (already done previously)"
+    echo "    - Phase 2 (API testing)            → LIMITED to changed endpoints (ask user which)"
+    echo "    - Phase 3-6                         → run normally"
+fi
+
+export MODE
+```
+
+If user wants to override (e.g. force NEW for a re-do), they can say so before
+Step 0.2. Don't proceed silently.
+
+### Step 0.2: Validate Paths + Create Directories
 
 ### Step 0.2: Validate Paths + Create Directories
 
@@ -120,10 +273,15 @@ Check the following directories and files in `{work_dir}`:
 
 ### Step 0.5.2: Determine Resume Point
 
-Apply the following rules **in order** (first match wins):
+Apply the following rules **in order** (first match wins). Rows checked include
+both `{work_dir}` artifacts AND `~/.claude/state/parse-workflow/{platform}.json`
+(cross-session signal).
 
 | Condition | Resume From | Rationale |
 |-----------|-------------|-----------|
+| `handoff.json` exists AND state file says `last_step == "completed"` | **Done** — narrate "fully complete" + offer to re-validate or jump to next skill | Workflow finished previously; nothing left to do |
+| `handoff.json` exists but state file says `last_step != "completed"` | Run `validate_handoff.py` first; if passes → **Phase 6 Step 6.3** (re-prompt for next skill); else **Phase 6 Step 6.2** (regenerate handoff) | Handoff exists but was never finalized |
+| `test/stress_test.py` exists AND state file says stress test passed | **Phase 6** (handoff generation) | Stress test was the last thing; proceed to handoff |
 | `result/` has CSV files containing data rows for all expected tables | **Phase 4** (re-validate) | Parse completed previously; re-validate with fresh data |
 | `result/` has CSVs but only `finder_result.csv` has data rows (detail tables empty/headers-only) | **Phase 4 Step 4.1** (re-run detail parse) | Finder validated but detail parse needs testing |
 | `parse/` has both `finder_parse.py` AND `detail_parse.py` | **Phase 4** (test them) | Both parse scripts complete; validate output |
@@ -133,6 +291,25 @@ Apply the following rules **in order** (first match wins):
 | `doc/project_analysis_summary.md` AND `test/test_api.py` exist | **Phase 2** (API testing) | Project analyzed; proceed to test APIs |
 | `{work_dir}` exists but has only subdirectories or minimal content | **Phase 1** (analyze project) | Workspace initialized but no real work done |
 | `{work_dir}` does not exist | **Phase 0** (start fresh) | Already handled by Phase 0 directory creation |
+
+**Cross-session shortcut:** if `state_read $PLATFORM_GUESS` returns
+`{"last_step": "phase_4_validated", ...}`, that's a stronger signal than file
+scanning — use it directly to resume from the next phase.
+
+```bash
+# Check state file for cross-session resume hint
+LAST_STATE=$(state_read "$PLATFORM_GUESS")
+LAST_STEP=$(echo "$LAST_STATE" | jq -r '.last_step // empty')
+LAST_TS=$(echo   "$LAST_STATE" | jq -r '.last_ts   // empty')
+if [[ -n "$LAST_STEP" ]]; then
+    AGE_HOURS=$(python3 -c "
+from datetime import datetime,timezone
+t = datetime.fromisoformat('${LAST_TS}'.replace('Z','+00:00'))
+print(int((datetime.now(timezone.utc) - t).total_seconds() / 3600))
+" 2>/dev/null || echo "?")
+    echo "📂 State file says: last_step='$LAST_STEP' (${AGE_HOURS}h ago)"
+fi
+```
 
 ### Step 0.5.3: Notify and Resume
 
@@ -214,25 +391,93 @@ Based on the analysis from Steps 1.1-1.3, write test scripts in `{work_dir}/test
 - [ ] Request interval (1-3 second sleep between requests)
 - [ ] Error handling with informative error messages (not bare exceptions)
 
-### Step 1.5: Generate Test Coordinates
+### Step 1.5: Generate Test Coordinates (WebSearch-driven, not pre-bundled)
 
-The Finder endpoint requires latitude/longitude coordinates to search for outlets. The AI autonomously generates a set of test coordinates based on the platform's country:
+The Finder endpoint requires latitude/longitude coordinates. **Do NOT use my
+own knowledge for this** — my training data is dated and biased toward popular
+markets. Use real-time **WebSearch** to find current restaurant-dense areas
+for the target country.
 
-**Generation rules:**
-- Select **major cities** in the country (high population, restaurant-dense)
-- Prefer popular tourist areas, food districts, commercial centers, and other restaurant-dense locations
-- Take 1-3 commonly used location coordinates per city, **10-20 coordinate points** total
+**Procedure:**
 
-**Output file:** `{work_dir}/location/coordinates.json`
+1. **First check** `{work_dir}/location/coordinates.json` — if it exists, REUSE
+   it. Don't re-search every run. Resume-friendly + idempotent.
 
-```json
-[
-  {"lat": -23.5505, "lng": -46.6333, "city": "Sao Paulo", "note": "Centro"},
-  {"lat": -22.9068, "lng": -43.1729, "city": "Rio de Janeiro", "note": "Centro"}
-]
+2. **If missing**, run WebSearch in 3 parallel queries:
+   ```
+   WebSearch: "popular food delivery areas {country} 2026"
+   WebSearch: "best restaurant districts {country} major cities"
+   WebSearch: "{country} food scene cities high density"
+   ```
+   Parse search snippets to extract candidate cities (target 4-6 distinct cities).
+
+3. **For each candidate city, WebSearch precise coordinates:**
+   ```
+   WebSearch: "{city} {country} city center latitude longitude"
+   WebSearch: "{food district name} {city} coordinates"   # if a specific district was named
+   ```
+   Take the most-cited lat/lon (often appears in Wikipedia / Google / GeoNames).
+
+4. **Validate the generated set** before writing:
+   - ✅ At least **3 distinct cities** (avoid single-city bias)
+   - ✅ Each city: 1-3 coordinates, total **10-20 points**
+   - ✅ All lat/lon within the country's rough geographic bounds (sanity check —
+     for example, Brazil lat is between roughly -34 and 5)
+   - ✅ Coordinates look like real numbers (not 0,0 or obviously rounded centroids)
+
+5. **Write** to `{work_dir}/location/coordinates.json` with `note` field
+   citing the WebSearch source / district reason.
+
+6. **Narrate** what was selected:
+   ```
+   📍 Generated 12 test coordinates for {country} via WebSearch:
+       - Sao Paulo (3 coords): Centro / Vila Madalena / Itaim Bibi
+       - Rio de Janeiro (3 coords): Centro / Copacabana / Ipanema
+       - Brasilia (2 coords): Asa Sul / Asa Norte
+       - Belo Horizonte (2 coords): Savassi / Funcionários
+       - Salvador (2 coords): Pituba / Barra
+   ```
+
+**Fallback when WebSearch is unavailable** (rate-limited / network blocked):
+
+```bash
+# Tiny embedded dictionary for the most common business markets — only used
+# when WebSearch fails. Covers ~80% of historical platforms.
+case "$COUNTRY" in
+    BR) FALLBACK='[{"lat":-23.5505,"lng":-46.6333,"city":"Sao Paulo","note":"Centro"},
+                   {"lat":-22.9068,"lng":-43.1729,"city":"Rio de Janeiro","note":"Centro"},
+                   {"lat":-15.7942,"lng":-47.8822,"city":"Brasilia","note":"Centro"}]';;
+    US) FALLBACK='[{"lat":40.7589,"lng":-73.9851,"city":"New York","note":"Times Square"},
+                   {"lat":34.0522,"lng":-118.2437,"city":"Los Angeles","note":"Downtown"},
+                   {"lat":41.8781,"lng":-87.6298,"city":"Chicago","note":"Loop"}]';;
+    GB) FALLBACK='[{"lat":51.5074,"lng":-0.1278,"city":"London","note":"Soho"},
+                   {"lat":53.4808,"lng":-2.2426,"city":"Manchester","note":"Northern Quarter"},
+                   {"lat":55.9533,"lng":-3.1883,"city":"Edinburgh","note":"Old Town"}]';;
+    DE) FALLBACK='[{"lat":52.5200,"lng":13.4050,"city":"Berlin","note":"Mitte"},
+                   {"lat":48.1351,"lng":11.5820,"city":"Munich","note":"Altstadt"},
+                   {"lat":53.5511,"lng":9.9937,"city":"Hamburg","note":"Sankt Pauli"}]';;
+    FR) FALLBACK='[{"lat":48.8566,"lng":2.3522,"city":"Paris","note":"Le Marais"},
+                   {"lat":45.7640,"lng":4.8357,"city":"Lyon","note":"Vieux Lyon"},
+                   {"lat":43.2965,"lng":5.3698,"city":"Marseille","note":"Vieux Port"}]';;
+    *)  echo "❌ WebSearch unavailable AND no fallback for country=$COUNTRY"
+        echo "   Please provide coordinates manually as JSON, OR try Phase 2 with a single coordinate"
+        exit 1;;
+esac
+echo "$FALLBACK" > "$WORK_DIR/location/coordinates.json"
+echo "⚠️  Used hardcoded fallback for $COUNTRY (3 cities). WebSearch failed."
 ```
 
-> All subsequent steps that need coordinates should read from this file uniformly — do not hardcode in scripts.
+> All subsequent steps that need coordinates should read from
+> `{work_dir}/location/coordinates.json` uniformly — do not hardcode in scripts.
+
+**Inline error decisions:**
+
+| If you see… | Likely cause | Do |
+|---|---|---|
+| WebSearch returns no useful hits for `{country}` | Country name spelling / niche market | Try synonyms (e.g. "UK" vs "United Kingdom"); ask user |
+| Coordinates outside country bounds | Search returned a tourist-named place in another country | Re-search with `{city}, {country}` qualifier |
+| All coordinates clustered in one city | Search bias | Force diversity: search "second largest cities {country}" |
+| Phase 2 finder returns 0 outlets at every coord | Bad coordinates OR platform's coverage doesn't include those cities | Check platform's coverage map; user may know the right cities |
 
 ### Step 1.6: Knowledge Persistence
 Write all findings above to `{work_dir}/doc/project_analysis_summary.md`:
@@ -337,10 +582,55 @@ Write to: `{work_dir}/doc/detail_response_json_structure_analysis.md`
 |---------|---------------|------------|
 | 403 | Cookie/auth expired | Check auth generation, ensure fresh cookies |
 | 403 after first request | IP/Session mismatch | Ensure cookie generation and request use the same proxy session |
+| 401 | Auth header missing / wrong token | Check the auth-header generation in reverse-engineered code |
 | 429 | Rate limiting | Increase request interval (1-3 seconds) |
 | 200 but empty data | Incorrect coordinates/params | Use verified coordinates from reverse-engineered project |
 | Connection timeout | Proxy issues | Check proxy configuration |
 | SSL error | TLS fingerprint detection | Use curl_cffi browser fingerprinting |
+| Cloudflare challenge HTML in response body | CF JS challenge | Check whether reverse project handles JS challenge; use Web Unlocker if needed |
+| Captcha required | Anti-bot escalation | Cannot bypass in script — escalate to user / reverse-engineering team |
+| 451 / 403 with country mention | Geographic block | Use proxy in correct country; verify proxy region |
+
+---
+
+## Pre-Phase 3 Gate (STOP-style, all 4 must pass)
+
+Before writing parse code, verify that we have everything needed to write GOOD
+code — not just code that runs.
+
+```
+G1 Response samples valid       — At least 3 finder + 3 detail JSONs in response/  [✅ / ❌]
+G2 Schema source determined     — Either temp/schema_*.csv OR default schema.md    [✅ / ❌]
+G3 JSON analysis docs complete  — Both *_analysis.md files have field mapping table [✅ / ❌]
+G4 Platform constants resolved  — PLATFORM, ID_PLATFORM, SOURCE_COUNTRY in doc/    [✅ / ❌]
+```
+
+Any FAIL → STOP, narrate which gate, fix the underlying phase before proceeding.
+
+```bash
+# G1
+F=$(ls "$WORK_DIR/response/finder"*.json 2>/dev/null | wc -l)
+D=$(ls "$WORK_DIR/response/detail"*.json 2>/dev/null | wc -l)
+[[ "$F" -ge 3 ]] && echo "✅ G1.finder ($F samples)" || echo "❌ G1.finder ($F < 3)"
+[[ "$D" -ge 3 ]] && echo "✅ G1.detail ($D samples)" || echo "❌ G1.detail ($D < 3)"
+
+# G2
+if [[ -f "$WORK_DIR/temp/schema_outlet_information.csv" ]]; then
+    echo "✅ G2 schema source: $WORK_DIR/temp/ (extra fields included)"
+else
+    echo "✅ G2 schema source: default schema.md"
+fi
+
+# G3
+[[ -f "$WORK_DIR/doc/finder_response_json_structure_analysis.md" ]] \
+    && echo "✅ G3.finder analysis exists" || echo "❌ G3.finder missing"
+[[ -f "$WORK_DIR/doc/detail_response_json_structure_analysis.md" ]] \
+    && echo "✅ G3.detail analysis exists" || echo "❌ G3.detail missing"
+
+# G4
+grep -qE "^- PLATFORM:" "$WORK_DIR/doc/project_analysis_summary.md" 2>/dev/null \
+    && echo "✅ G4 platform constants in doc" || echo "❌ G4 constants missing"
+```
 
 ---
 
@@ -356,37 +646,81 @@ Before writing, you must read:
 - `{work_dir}/doc/detail_response_json_structure_analysis.md`
 - `{work_dir}/doc/project_analysis_summary.md` — to retrieve platform constants
 
-### Step 3.1.5: Query Finder Table Schema from MySQL
+### Step 3.1.5: Reuse MySQL Finder Schema from Phase 0 Preflight
 
-Before writing `finder_parse.py`, query the platform's actual MySQL table to determine which fields the finder should output:
+The MySQL finder-schema query was already executed in **Phase 0 Step 0.1.5**
+(early-binding) and the result was saved to:
 
-```python
-import json, boto3, pymysql
-
-s3 = boto3.client('s3', region_name='eu-central-1')
-obj = s3.get_object(Bucket='dash-dbcenter', Key='config/general_config/config.json')
-config = json.loads(obj['Body'].read())
-
-conn = pymysql.connect(
-    host=config['host'], user=config['user'], password=config['passwd'],
-    port=3306, database='{ID_PLATFORM}', connect_timeout=10
-)
-cursor = conn.cursor()
-cursor.execute('SHOW TABLES')
-tables = [r[0] for r in cursor.fetchall()]
-# Pick the first prefix table (e.g. 'UK', 'US', 'BR')
-if tables:
-    cursor.execute(f'DESCRIBE `{tables[0]}`')
-    print(f'=== {ID_PLATFORM}.{tables[0]} finder schema ===')
-    for row in cursor.fetchall():
-        print(f'  {row[0]:30s} {row[1]:20s} NULL={row[2]}')
-conn.close()
+```
+$STATE_DIR/mysql_discovery_${PLATFORM}.json
 ```
 
-- If the platform **already exists in MySQL** → the table columns define exactly which fields `parse_finder` should output. `id_outlet` is always the primary key; other columns are the accompanying fields to extract.
-- If the platform **is brand new** (no MySQL table yet) → fall back to the minimum: `id_outlet` is the only required field. Extract any additional fields that the Finder API returns and that match `outlet_information` schema fields (e.g. `rating`, `cuisine`, `lat`, `lon`).
+Reuse it here — no need to re-query:
 
-Save the discovered schema to `{work_dir}/doc/finder_table_schema.md` for reference.
+```bash
+DISCOVERY=$(cat "$STATE_DIR/mysql_discovery_${PLATFORM_GUESS:-${PLATFORM}}.json" 2>/dev/null)
+
+if [[ -z "$DISCOVERY" ]]; then
+    echo "⚠️  Phase 0 didn't run preflight (or state file missing). Re-running query inline:"
+    # (Same Python block as Step 0.1.5, abbreviated; see there for full version)
+    DISCOVERY=$(python3 << PYEOF
+import json, boto3, pymysql
+try:
+    s3 = boto3.client('s3', region_name='eu-central-1')
+    obj = s3.get_object(Bucket='dash-dbcenter', Key='config/general_config/config.json')
+    cfg = json.loads(obj['Body'].read())
+    conn = pymysql.connect(host=cfg['host'], user=cfg['user'], password=cfg['passwd'],
+                            port=3306, database='${ID_PLATFORM}', connect_timeout=10)
+    cur = conn.cursor()
+    cur.execute('SHOW TABLES')
+    tables = [r[0] for r in cur.fetchall()]
+    out = {"matched_db": "${ID_PLATFORM}", "tables": tables[:20]}
+    if tables:
+        cur.execute(f"DESCRIBE \`{tables[0]}\`")
+        out["finder_schema"] = [{"field": r[0], "type": r[1], "null": r[2]} for r in cur.fetchall()]
+    conn.close()
+    print(json.dumps(out))
+except Exception as e:
+    print(json.dumps({"error": str(e)[:200]}))
+PYEOF
+)
+fi
+
+# Extract finder schema fields (column names other than auto-managed dashmote columns)
+FINDER_FIELDS=$(echo "$DISCOVERY" | jq -r '
+    if .finder_schema then
+        .finder_schema | map(.field) | map(select(. != "created_at" and . != "last_refresh"))
+    else []
+    end | join(",")
+')
+
+if [[ -n "$FINDER_FIELDS" ]]; then
+    echo "✅ MySQL finder schema (Phase 0): $FINDER_FIELDS"
+    # Persist a human-readable doc
+    echo "$DISCOVERY" | jq '.finder_schema // []' > "$WORK_DIR/doc/finder_table_schema.md.tmp"
+    {
+        echo "# Finder Table Schema (from MySQL ${ID_PLATFORM})"
+        echo ""
+        echo "Required output columns of \`finder_parse.py\` (extracted in Phase 0 preflight):"
+        echo ""
+        echo "$DISCOVERY" | jq -r '.finder_schema[] | "- `\(.field)` (\(.type), null=\(.null))"'
+    } > "$WORK_DIR/doc/finder_table_schema.md"
+    rm -f "$WORK_DIR/doc/finder_table_schema.md.tmp"
+else
+    echo "ℹ️  No MySQL finder schema found — NEW platform."
+    echo "    finder_parse.py output: id_outlet (mandatory) + any extra fields the API returns"
+    echo "    that match outlet_information schema (rating, cuisine, lat, lon, …)"
+fi
+```
+
+**Decision summary:**
+- Platform **exists in MySQL** → finder must output exactly the columns listed
+  in `finder_table_schema.md`. `id_outlet` is always the primary key.
+- Platform **brand new** (no MySQL table) → minimum is `id_outlet`; opportunistically
+  extract any extra fields that match `outlet_information` schema.
+
+The discovered schema lives at `{work_dir}/doc/finder_table_schema.md` for
+reference by Step 3.2.
 
 ### Step 3.2: Write finder_parse.py
 
@@ -519,12 +853,106 @@ python {skill_dir}/validate_output.py --result-dir {work_dir}/result/ [--schema-
 
 Confirm the newly appended data passes all checks.
 
-### Step 4.4: Assess Results
-- **All passed** -> Proceed to Phase 5
-- **Issues found** -> Identify the problem, go back to the corresponding Phase to fix:
-  - Field mapping error -> Return to Phase 3 to modify parse code
-  - Endpoint request issue -> Return to Phase 2 to troubleshoot
-  - Response structure change -> Update knowledge documents in doc/
+### Step 4.4: Semantic Sanity Check (NEW — beyond schema)
+
+The validator only checks structural conformance (column names, types, nulls).
+It does NOT catch "this column is mostly empty" — which usually means a wrong
+JSON path. Sample the actual data:
+
+```bash
+# For each output CSV, check non-null ratio per column
+python3 << 'PYEOF'
+import csv, json, os
+from pathlib import Path
+
+result_dir = Path(os.environ['WORK_DIR']) / "result"
+report = {}
+
+for csv_path in result_dir.glob("*.csv"):
+    if csv_path.stem == "finder_result":
+        continue   # finder is small / acceptable to skip
+    with open(csv_path, newline='', encoding='utf-8') as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+    if not rows:
+        report[csv_path.stem] = {"row_count": 0, "warning": "no rows"}
+        continue
+
+    cols = reader.fieldnames or []
+    pcts = {}
+    for col in cols:
+        non_null = sum(1 for r in rows if r.get(col) not in (None, "", "None"))
+        pct = round(100 * non_null / len(rows), 1)
+        pcts[col] = pct
+
+    suspicious = {c: p for c, p in pcts.items() if p < 50}
+    report[csv_path.stem] = {
+        "row_count": len(rows),
+        "non_null_pct": pcts,
+        "suspicious_columns_below_50pct": suspicious,
+    }
+
+print(json.dumps(report, indent=2))
+PYEOF
+```
+
+**Decision tree:**
+
+| Result | Verdict | Action |
+|---|---|---|
+| All non-`Must=NO` columns ≥ 80% filled | ✅ clean | Proceed to Pre-Phase 5 Gate |
+| Some columns 50-79% filled | ⚠️ partial | Narrate per-column percentages; user decides whether to proceed or fix mappings in Phase 3 |
+| Any `Must=YES` column < 50% | ❌ likely wrong path | STOP — wrong JSON path is the most common cause; re-check Phase 2 analysis docs |
+
+**Sample 5 rows back to user** for visual sanity check:
+
+```bash
+for csv in "$WORK_DIR/result/"*.csv; do
+    echo "=== $(basename $csv) ==="
+    head -1 "$csv"
+    head -6 "$csv" | tail -5
+done
+```
+
+### Step 4.5: Assess Results
+- **All passed (structural + semantic clean)** → Proceed to Pre-Phase 5 Gate
+- **Issues found** → Identify the problem, go back to fix:
+  - Field mapping error → Return to Phase 3 to modify parse code
+  - Endpoint request issue → Return to Phase 2 to troubleshoot
+  - Response structure change → Update knowledge documents in doc/
+  - High null ratio in `Must=YES` column → Re-check JSON path in Phase 2 analysis doc
+
+---
+
+## Pre-Phase 5 Gate (STOP-style, all 3 must pass)
+
+Before launching the 30-minute stress test, verify it can actually run:
+
+```
+G1 Phase 4 verdict was ✅ clean (or ⚠️ user accepted)        [✅ / ❌]
+G2 Auth/cookies still fresh (re-issue a single test request)  [✅ / ❌]
+G3 Proxy still reachable (proxy GET to a known URL)            [✅ / ❌]
+```
+
+```bash
+# G1 — Phase 4 result
+[[ -f "$WORK_DIR/.phase4_passed" ]] && echo "✅ G1" || echo "❌ G1: Phase 4 not marked passed"
+
+# G2 — fresh auth test
+python3 -c "
+import sys; sys.path.insert(0, '$WORK_DIR/test')
+from test_api import test_finder
+import json
+coord = json.load(open('$WORK_DIR/location/coordinates.json'))[0]
+resp = test_finder(coord['lat'], coord['lng'])
+print('✅ G2' if resp else '❌ G2: auth/test failed')
+" 2>&1 | tail -1
+
+# G3 — proxy reachable (use whatever proxy the reverse project uses)
+# This is platform-specific — narrate "checking proxy via test_api flow"
+```
+
+Any FAIL → STOP, fix before launching stress test.
 
 ---
 
@@ -534,15 +962,15 @@ Confirm the newly appended data passes all checks.
 
 > **Must pause for confirmation:**
 > ```
-> Phase 4 test validation passed. Launch Phase 5 stress test (30 minutes)?
-> Enter "yes" to start, or "skip" to finish directly.
+> Phase 4 + Pre-Phase 5 Gate passed. Launch Phase 5 stress test (30 minutes)?
+> Enter "yes" to start, "skip" to finish directly, or "duration N" for custom minutes.
 > ```
-> If user says skip -> **Jump directly to Phase 6**
+> If user says skip → **Jump directly to Phase 6**
 
 ### Execution
 
 1. Read [stress-test-spec.md](stress-test-spec.md) and write `{work_dir}/test/stress_test.py` following its detailed specifications
-2. Run the stress test; output statistics report after 30 minutes
+2. Run the stress test; output statistics report after the configured duration
 3. Assess results according to the pass criteria in [stress-test-spec.md](stress-test-spec.md)
 
 > Detailed stress test requirements (concurrency model, statistics format, pass criteria, etc.) are in [stress-test-spec.md](stress-test-spec.md) — not repeated here.
@@ -626,22 +1054,118 @@ Field notes:
 - `finder_fields`: actual column headers from `result/finder_result.csv`
 - All paths in `outputs` are relative to `work_dir`
 
-### Step 6.3: Prompt for ConSo Migration
+### Step 6.2.5: Validate handoff.json (downstream contract)
 
-After generating the handoff file, ask the user:
+Before declaring Phase 6 done, validate that `handoff.json` actually conforms
+to what `/conso-migrate` expects:
 
+```bash
+python "$CLAUDE_SKILL_DIR/scripts/validate_handoff.py" \
+    --handoff "$WORK_DIR/handoff.json" 2>&1 | tee /tmp/parse-handoff-verdict.json
+
+HANDOFF_VERDICT=$(jq -r '.verdict // "unknown"' /tmp/parse-handoff-verdict.json)
+HANDOFF_ERRORS=$(jq -r '.errors // [] | length' /tmp/parse-handoff-verdict.json)
 ```
-Parse workflow complete! Ready to proceed to ConSo migration?
 
-Enter "yes" to launch /conso-migrate (will use parse outputs automatically)
-Enter "no" to finish here
+If `HANDOFF_VERDICT != "valid"`:
+- Print the validator errors
+- Loop back to Step 6.2 to fix
+- Do NOT proceed to Step 6.3
+
+### Step 6.3: Persist State + Verdict-Driven Next Steps
+
+Write the cross-session state file:
+
+```bash
+state_write "$PLATFORM" "completed" "$(jq -n \
+    --arg v       "$HANDOFF_VERDICT" \
+    --arg work    "$WORK_DIR" \
+    --arg country "$COUNTRY" \
+    --arg mode    "$MODE" \
+    --argjson stress "${STRESS_PASSED:-false}" \
+    --argjson semantic "${SEMANTIC_VERDICT:-\"unknown\"}" \
+    '{handoff_verdict:$v, work_dir:$work, country:$country, mode:$mode,
+      stress_passed:$stress, semantic_verdict:$semantic}')"
 ```
 
-- **User says yes** → invoke the `conso-migrate` skill. The conso-migrate skill will detect `{work_dir}/handoff.json` and use it to skip redundant analysis and reuse parse outputs.
-- **User says no** → print completion summary and end.
+Now compute overall workflow verdict and recommend specific next action:
+
+```bash
+# Verdict combines Phase 4 semantic + Phase 5 stress + handoff validity
+case "${SEMANTIC_VERDICT}_${STRESS_PASSED}_${HANDOFF_VERDICT}" in
+    clean_*_valid)              VERDICT="complete_clean"        ;;
+    partial_*_valid)            VERDICT="complete_with_warnings";;
+    *_*_valid)                  VERDICT="partial_validation"    ;;
+    *)                          VERDICT="failed"                ;;
+esac
+
+case "$VERDICT" in
+    complete_clean)
+        cat <<EOF
+✅ Parse workflow complete (clean).
+
+Output:           $WORK_DIR
+Platform:         $PLATFORM ($COUNTRY)
+Mode:             $MODE
+handoff.json:     valid
+
+Recommended next: launch ConSo migration with the handoff:
+    /conso-migrate $WORK_DIR
+
+Other options:
+- /run-detail (after migration deploys) — sanity-test the spider on a few outlets
+- Manual review of doc/*.md before migration
+EOF
+        ;;
+    complete_with_warnings)
+        cat <<EOF
+⚠️  Parse workflow complete with warnings.
+
+Phase 4 semantic check: $SEMANTIC_VERDICT (some columns < 80% filled)
+handoff.json:           valid
+
+Recommended next:
+1. Review the per-column fill ratios in doc/ — confirm low-fill is expected
+   (some platforms genuinely don't return certain fields)
+2. If acceptable: /conso-migrate $WORK_DIR
+3. If not acceptable: revisit Phase 3 / Phase 2 mappings
+EOF
+        ;;
+    partial_validation)
+        cat <<EOF
+⚠️  Parse workflow incomplete — partial validation.
+
+Stress test:    ${STRESS_PASSED}
+Semantic check: $SEMANTIC_VERDICT
+handoff.json:   valid (but data quality questionable)
+
+Recommended next:
+- DO NOT migrate yet. Investigate the failed validation step before continuing.
+- Re-run /parse-workflow — Phase 0.5 will resume from the failed step.
+EOF
+        ;;
+    failed)
+        cat <<EOF
+❌ Parse workflow failed.
+
+handoff.json:   $HANDOFF_VERDICT
+Phase 4:        $SEMANTIC_VERDICT
+Phase 5:        $STRESS_PASSED
+
+Do NOT migrate. Investigate:
+- handoff.json errors: cat /tmp/parse-handoff-verdict.json
+- Phase 4 semantic report: see narrative above
+- Phase 5 stress test log: $WORK_DIR/test/stress_test_*.log
+EOF
+        ;;
+esac
+```
 
 ### Step 6.4: End
-Workflow complete. Await user's next instructions.
+Workflow complete. State file persisted at `~/.claude/state/parse-workflow/$PLATFORM.json`.
+Downstream skills (`/conso-migrate`, `/run-detail`) will read this for context.
+
+Await user's next instructions — typically `/conso-migrate $WORK_DIR`.
 
 ---
 

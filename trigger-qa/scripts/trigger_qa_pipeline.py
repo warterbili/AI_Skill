@@ -35,9 +35,22 @@ DEFAULT_TABLES = [
     "option_relation",
 ]
 DEFAULT_REGION = "eu-central-1"
-DEFAULT_FUNCTION_NAME = (
-    "arn:aws:lambda:eu-central-1:593453040104:function:dash-sourcing-pipeline-spark"
-)
+# Use the function NAME only — AWS CLI resolves it against the caller's account.
+# Pass a full ARN via --function-name to invoke a Lambda in a different account.
+DEFAULT_FUNCTION_NAME = "dash-sourcing-pipeline-spark"
+
+# EMR terminal states — cluster won't change after these
+EMR_TERMINAL_STATES = {"TERMINATED", "TERMINATED_WITH_ERRORS"}
+EMR_HEALTHY_STATES  = {"RUNNING", "WAITING"}
+
+
+# ---------------------------------------------------------------------------
+# Output streams — narrate to stderr, JSON to stdout
+# ---------------------------------------------------------------------------
+
+def _log(msg: str) -> None:
+    """Narration goes to stderr so stdout stays pure JSON for jq parsing."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +85,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-verify-emr", action="store_true")
     parser.add_argument("--verify-attempts", type=int, default=10)
     parser.add_argument("--verify-interval", type=int, default=3)
+    parser.add_argument(
+        "--check-existing", action="store_true",
+        help="Before invoking, check for an active EMR cluster with the same name "
+             "in the last 60 min. If found, include it in the output JSON as "
+             "'existing_clusters_warning' so the caller can decide whether to proceed.",
+    )
+    parser.add_argument(
+        "--wait-for-completion", action="store_true",
+        help="After cluster is found, keep polling until it reaches a terminal "
+             "state (TERMINATED / TERMINATED_WITH_ERRORS). Useful for CI/QA gates.",
+    )
+    parser.add_argument(
+        "--completion-timeout", type=int, default=1800,
+        help="Max seconds to wait for cluster completion (default 1800 = 30 min).",
+    )
+    parser.add_argument(
+        "--completion-poll-interval", type=int, default=30,
+        help="Seconds between completion polls (default 30).",
+    )
     return parser.parse_args()
 
 
@@ -232,6 +264,72 @@ def find_cluster(
     return None
 
 
+def check_existing_clusters(cluster_name: str, region: str) -> List[Dict[str, Any]]:
+    """Return any active EMR clusters with the same name (created in last 60 min).
+
+    Helps prevent accidental double-triggers — running two QA pipelines for the
+    same (platform, country, refresh) wastes ~$5-20 of EMR time and confuses
+    downstream consumers.
+    """
+    cmd = ["aws", "emr", "list-clusters", "--active", "--region", region,
+           "--created-after", str(int(time.time() - 3600))]
+    response = run_aws_json(cmd)
+    return [c for c in response.get("Clusters", []) if c.get("Name") == cluster_name]
+
+
+def wait_for_cluster_completion(
+    cluster_id: str, region: str, timeout: int, interval: int
+) -> Dict[str, Any]:
+    """Poll cluster state until terminal or timeout. Returns final state info."""
+    start = time.time()
+    transitions: List[Dict[str, str]] = []
+    last_state: Optional[str] = None
+
+    while True:
+        elapsed = int(time.time() - start)
+        try:
+            resp = run_aws_json([
+                "aws", "emr", "describe-cluster",
+                "--cluster-id", cluster_id, "--region", region,
+            ])
+        except Exception as e:
+            _log(f"  [{elapsed}s] describe-cluster error: {e}")
+            time.sleep(interval)
+            if elapsed > timeout:
+                break
+            continue
+
+        cluster = resp.get("Cluster", {})
+        state = cluster.get("Status", {}).get("State", "UNKNOWN")
+        reason = cluster.get("Status", {}).get("StateChangeReason", {}).get("Message", "")
+
+        if state != last_state:
+            transitions.append({"state": state, "at": f"+{elapsed}s", "reason": reason})
+            _log(f"  [{elapsed}s] state: {last_state or '(start)'} → {state}  {reason}")
+            last_state = state
+
+        if state in EMR_TERMINAL_STATES:
+            return {
+                "final_state":      state,
+                "final_reason":     reason,
+                "elapsed_seconds":  elapsed,
+                "timed_out":        False,
+                "transitions":      transitions,
+            }
+
+        if elapsed > timeout:
+            _log(f"  ⏰ timeout after {timeout}s — cluster still {state}")
+            return {
+                "final_state":      state,
+                "final_reason":     reason,
+                "elapsed_seconds":  elapsed,
+                "timed_out":        True,
+                "transitions":      transitions,
+            }
+
+        time.sleep(interval)
+
+
 def emr_console_link(region: str, cluster_id: str) -> str:
     return (
         "https://{region}.console.aws.amazon.com/elasticmapreduce/home"
@@ -252,20 +350,58 @@ def main() -> None:
     tables = normalize_tables(args.tables)
     engineer_map = load_engineer_map(args.engineer_map_file)
     engineer_id = resolve_engineer_id(args, engineer_map)
+    _log(f"Resolved engineer: {args.engineer_name or '(direct id)'} → {engineer_id}")
+
     caller = get_caller_identity(args.region)
-    payload = build_payload(args, engineer_id, tables)
-    lambda_result = invoke_lambda(payload, args)
+    _log(f"AWS account: {caller.get('Account')}  arn: {caller.get('Arn', '?')}")
 
     cluster_name = f"sourcing-pipeline-{args.platform}-{args.country}-{args.refresh}"
-    cluster = None
+
+    # ---- Pre-invoke: check for existing cluster (if requested) ----
+    existing_warning: Optional[List[Dict[str, Any]]] = None
+    if args.check_existing:
+        _log(f"Checking for existing clusters named {cluster_name} (last 60 min)...")
+        existing = check_existing_clusters(cluster_name, args.region)
+        if existing:
+            _log(f"⚠️  Found {len(existing)} existing cluster(s) with same name")
+            existing_warning = [
+                {"id": c["Id"], "state": c["Status"]["State"], "name": c["Name"]}
+                for c in existing
+            ]
+
+    # ---- Invoke Lambda ----
+    payload = build_payload(args, engineer_id, tables)
+    _log(f"Invoking {args.function_name}...")
+    lambda_result = invoke_lambda(payload, args)
+    _log("Lambda returned.")
+
+    # ---- Verify cluster started ----
+    cluster: Optional[Dict[str, Any]] = None
     if not args.no_verify_emr:
+        _log(f"Polling for cluster {cluster_name} (max {args.verify_attempts}×{args.verify_interval}s)...")
         cluster = find_cluster(
             cluster_name=cluster_name,
             region=args.region,
             attempts=args.verify_attempts,
             interval=args.verify_interval,
         )
+        if cluster:
+            _log(f"✅ Cluster found: {cluster['Id']} (state={cluster['Status']['State']})")
+        else:
+            _log("⚠️  Cluster not found within verification window")
 
+    # ---- Optional: wait for cluster completion ----
+    completion: Optional[Dict[str, Any]] = None
+    if args.wait_for_completion and cluster:
+        _log(f"Waiting for cluster {cluster['Id']} to complete (max {args.completion_timeout}s)...")
+        completion = wait_for_cluster_completion(
+            cluster_id=cluster["Id"],
+            region=args.region,
+            timeout=args.completion_timeout,
+            interval=args.completion_poll_interval,
+        )
+
+    # ---- Compose result ----
     result = {
         "caller_identity": caller,
         "request": {
@@ -293,7 +429,27 @@ def main() -> None:
             "interval_seconds": args.verify_interval,
             "cluster_found": cluster is not None,
         },
+        "existing_clusters_warning": existing_warning,
+        "completion": completion,
     }
+
+    # Top-level verdict for callers (Claude / SKILL.md / bot)
+    if completion:
+        if completion["final_state"] == "TERMINATED":
+            result["verdict"] = "completed_success"
+        elif completion["final_state"] == "TERMINATED_WITH_ERRORS":
+            result["verdict"] = "completed_with_errors"
+        elif completion["timed_out"]:
+            result["verdict"] = "completion_timeout"
+        else:
+            result["verdict"] = f"unexpected_state_{completion['final_state']}"
+    elif cluster:
+        result["verdict"] = "triggered_cluster_started"
+    elif lambda_result["metadata"].get("StatusCode") in (200, 202):
+        result["verdict"] = "triggered_no_cluster_observed"
+    else:
+        result["verdict"] = "lambda_invoke_failed"
+
     print(json.dumps(result, indent=2))
 
 
