@@ -1,50 +1,208 @@
 # AI Skills
 
-Personal collection of AI-assisted automation skills for sourcing data pipelines.
+A collection of Claude Code skills that automate the **end-to-end sourcing
+pipeline** — from parsing a new food-delivery platform's APIs all the way to
+running monthly crawls on Fargate and triggering QA.
 
-Each skill is a self-contained directory with a `skill.md` (or `SKILL.md`) definition and any supporting scripts or templates. Skills are designed to be used with Claude Code or similar AI coding assistants.
+Each skill is **self-contained** (a directory with `SKILL.md` + supporting
+scripts) and **chains into the next** through a shared state-file convention,
+so a complete migration doesn't require remembering 30 commands.
 
-## Skills
+---
 
-| Skill | Description | Key Files |
-|---|---|---|
-| [conso-migrate](conso-migrate/) | Migrate a platform to the ConSo (Consolidated Sourcing) architecture. Generates spider code, Dockerfile, CI workflows, and handles MySQL/Redis setup. | `SKILL.md`, templates |
-| [id-refresh](id-refresh/) | Re-crawl specific outlet IDs — push IDs from CSV to Redis, run the detail spider locally, verify S3 output. | `SKILL.md`, `scripts/id_refresh.py` |
-| [parse-workflow](parse-workflow/) | Parse and validate sourcing workflow definitions against schema conventions. | `SKILL.md`, `validate_output.py` |
-| [run-detail](run-detail/) | Launch ad-hoc detail spider runs on AWS Fargate with image validation, multi-instance support, OOM auto-recovery, and Loki log analysis. | `skill.md` |
-| [trigger-qa](trigger-qa/) | Trigger the sourcing QA pipeline on AWS by invoking Lambda and verifying EMR cluster creation. | `skill.md`, `scripts/trigger_qa_pipeline.py` |
+## The 6 Skills (in execution order)
 
-## Structure
+| # | Skill | Purpose | Key Files |
+|--:|---|---|---|
+| 1 | [parse-workflow](parse-workflow/) | Analyze a reverse-engineered crawler, write `finder_parse.py` + `detail_parse.py` for a new food-delivery platform. Outputs `handoff.json` for the next step. | `SKILL.md`, `workflow.md`, `scripts/validate_handoff.py`, `validate_output.py` |
+| 2 | [conso-migrate](conso-migrate/) | Take any crawler (Scrapy, Postman, Bruno, JS, Go…) and migrate it to the ConSo standard — spider code, Dockerfile, CI/CD, MySQL/Redis setup. Reads `handoff.json` if present. | `SKILL.md`, 13 templates |
+| 3 | [conso-deploy](conso-deploy/) | Deploy a migrated ConSo project to AWS — ECR repo, GitHub Actions, CloudWatch logs, EventBridge cron rules, CASS activation. | `SKILL.md` |
+| 4 | [run-detail](run-detail/) | Trigger ad-hoc detail spider runs on Fargate. Smart entry, multi-instance, OOM auto-recovery, post-run S3/MySQL data verification. | `SKILL.md` |
+| 5 | [id-refresh](id-refresh/) | Re-crawl a specific list of outlet IDs (from CSV). Dual mode: local Python or Fargate. Race-checked Redis push, ID-level landing verification. | `SKILL.md`, `scripts/id_refresh.py` |
+| 6 | [trigger-qa](trigger-qa/) | Trigger the sourcing QA pipeline (Lambda → EMR). Smart entry detects duplicate triggers, optional `--wait-for-completion` polls cluster through terminal state. | `SKILL.md`, `scripts/trigger_qa_pipeline.py` |
+
+---
+
+## How They Chain Together
+
+```
+                  ┌────────────────────────────────────┐
+                  │  parse-workflow                    │
+                  │  • analyze reverse-engineered code │
+                  │  • write parse demos               │
+                  │  • generate handoff.json           │
+                  └─────────────────┬──────────────────┘
+                                    │ handoff.json
+                                    ▼
+                  ┌────────────────────────────────────┐
+                  │  conso-migrate                     │
+                  │  • reads handoff.json (Phase 0.01) │
+                  │  • generates spider + Dockerfile   │
+                  │  • migrates MySQL/Redis            │
+                  └─────────────────┬──────────────────┘
+                                    │ ~/.claude/state/
+                                    ▼
+                  ┌────────────────────────────────────┐
+                  │  conso-deploy                      │
+                  │  • ECR + GitHub Actions            │
+                  │  • EventBridge monthly cron        │
+                  │  • Phase 5.5 deploy-time smoke test│
+                  └─────────────────┬──────────────────┘
+                                    │
+                ┌───────────────────┼───────────────────┐
+                ▼                   ▼                   ▼
+        ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+        │  run-detail   │   │  id-refresh   │   │  trigger-qa   │
+        │  full crawls  │   │  targeted fix │   │  QA validate  │
+        └───────────────┘   └───────────┬───┘   └───────▲───────┘
+                                        │               │
+                                        └───────────────┘
+                                        chain to QA after data fix
+```
+
+Each arrow represents a **state-file handoff**:
+`~/.claude/state/{skill}/{platform}.json` — written by the upstream skill,
+auto-discovered by the downstream skill's Proactive Preflight.
+
+---
+
+## Common Patterns Across All Skills
+
+Every skill in this repo follows the same "smart Claude" patterns so behaviour
+is predictable and skills compose cleanly:
+
+| Pattern | What it does |
+|---|---|
+| **Frontmatter** | `name`, `description`, `disable-model-invocation: true`, `allowed-tools` whitelist |
+| **Top-level rules** | Narrate every step • Auto-fix bounded (max 3 rounds) • Mode-switch • Leave-no-trace |
+| **Proactive Preflight** | Auto-detect everything possible (git remote, AWS account, sibling state) BEFORE asking the user |
+| **Phase 0 variable resolution** | Single source-of-truth table — every variable defined once, referenced everywhere |
+| **Cross-phase Invariants** | Explicit table of "things that MUST stay coupled or production breaks silently" |
+| **Pre-launch Gate (STOP-style)** | 4-6 hard checks before any production-touching action; any FAIL = STOP |
+| **Inline error decision tables** | At each phase, "if you see X, do Y" — Claude doesn't fish through the bottom of the doc |
+| **Verdict-driven Next Steps** | Final phase recommends specific next slash-command based on outcome |
+| **State files** | `~/.claude/state/{skill}/{key}.json` for cross-session resume + cross-skill awareness |
+| **JSON stdout / stderr narration** | Bundled scripts emit JSON on stdout, narration on stderr — pipeable through `jq` |
+
+These patterns mean that **once you're familiar with one skill, the rest feel
+identical** — same conventions, same assumptions, same rescue mechanisms.
+
+---
+
+## Layout
 
 ```
 AI_Skills/
 ├── README.md
+├── .gitignore
 ├── <skill-name>/
-│   ├── skill.md          # Skill definition (frontmatter + workflow)
-│   ├── scripts/          # Supporting scripts (optional)
-│   └── ...               # Templates, configs, etc. (optional)
-└── <another-skill>/
-    └── ...
+│   ├── SKILL.md          # Skill definition (frontmatter + workflow)
+│   ├── scripts/          # Supporting Python scripts (optional)
+│   └── *.template        # Code templates (optional)
+└── ...
 ```
 
-## Adding a New Skill
+---
 
-1. Create a new directory: `<skill-name>/`
-2. Add a `skill.md` with frontmatter:
+## Anatomy of a New Skill
+
+To add a new skill that fits this repo's style, copy the patterns from any
+existing one (id-refresh and trigger-qa are good "small reference" examples):
+
+1. **Create the directory:** `<skill-name>/` (use kebab-case, not snake_case).
+
+2. **Add `SKILL.md`** with full frontmatter:
    ```yaml
    ---
    name: <skill-name>
-   description: "<when to use this skill>"
+   description: "<one sentence on when to use it>. Trigger words: ..."
+   disable-model-invocation: true
+   allowed-tools: Read, Write, Edit, Bash, Glob, Grep
    ---
    ```
-3. Add supporting scripts or templates as needed
-4. Update this README's Skills table
+
+3. **Apply the standard skeleton:**
+   - Top-level rules (Narrate / Auto-fix bounded / Leave-no-trace)
+   - Proactive Preflight section (silent auto-detection BEFORE Startup)
+   - Startup self-introduction with Required Inputs
+   - Phase 0 variable resolution + state-file helpers
+   - Cross-phase Invariants table (4-7 invariants)
+   - Workflow steps with inline error decision tables
+   - Pre-launch Gate before any production-touching step
+   - Final phase: persist state file + verdict-driven Next Steps
+
+4. **Bundled scripts** (in `scripts/`) should:
+   - Validate inputs strictly (regex, type checks)
+   - Use parameterised SQL (never f-string interpolation of user input)
+   - Print structured JSON to stdout, narration to stderr
+   - Exit 0 on success, 1 on hard failure
+   - Avoid hardcoded AWS account IDs / secret names — discover at runtime
+
+5. **Update this README** — add a row to the Skills table and (if relevant)
+   adjust the chain diagram.
+
+---
 
 ## Usage
 
-These skills are loaded by placing them in the Claude Code skills directory:
+Place the skill in Claude Code's skills directory:
 
 - **Windows:** `C:\Users\<user>\.claude\skills\<skill-name>\`
 - **macOS/Linux:** `~/.claude/skills/<skill-name>/`
 
-Once placed, invoke a skill with `/<skill-name>` in Claude Code.
+Then invoke with `/<skill-name>` in Claude Code. Skills with
+`disable-model-invocation: true` will not be auto-suggested by Claude — they
+must be explicitly invoked. This is intentional for production-touching
+operations.
+
+To keep the local copy in sync with this repo, after a `git pull`:
+
+```bash
+for skill in conso-deploy conso-migrate id-refresh parse-workflow run-detail trigger-qa; do
+    rm -rf ~/.claude/skills/$skill
+    cp -r $(pwd)/$skill ~/.claude/skills/
+done
+```
+
+---
+
+## State Files
+
+Each skill that completes meaningful work writes a state file to:
+
+```
+~/.claude/state/<skill-name>/<platform-or-key>.json
+```
+
+These are NOT cleaned by the leave-no-trace rule (deliberately persistent).
+They serve two purposes:
+
+1. **Cross-session resume** — invoking the same skill again with the same
+   key surfaces the previous attempt and offers options (retry, view, abort).
+2. **Cross-skill awareness** — downstream skills' Proactive Preflight reads
+   upstream state to pre-fill inputs.
+
+To inspect or clear:
+
+```bash
+ls ~/.claude/state/                              # which skills have state
+ls ~/.claude/state/conso-migrate/                # which platforms have state
+cat ~/.claude/state/conso-migrate/EPL.json       # see what was recorded
+rm ~/.claude/state/conso-migrate/EPL.json        # force fresh start next time
+```
+
+---
+
+## Contributing
+
+This is a personal collection but PRs are welcome. Ground rules:
+
+- New skills should follow the patterns documented above (not optional —
+  consistency is what makes the chain work).
+- Don't hardcode user-specific paths (`C:\Users\<name>\...`), AWS account IDs,
+  or personal tokens. Use dynamic discovery.
+- Bundled scripts must be runnable on both Windows (Git Bash) and macOS/Linux —
+  use `MSYS_NO_PATHCONV=1` for `aws` calls that take `/`-prefixed args on Windows.
+- If you change a skill's contract (e.g. the JSON schema downstream skills
+  depend on), bump the relevant validator and update both producer + consumer
+  in the same PR.
