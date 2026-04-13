@@ -160,6 +160,112 @@ bash /path/to/get_session_token.sh
 Wait for the user to confirm credentials are active before continuing.
 Re-run `aws sts get-caller-identity` to confirm.
 
+### 0.01 Cross-skill Handoff Intake (parse-workflow → conso-migrate)
+
+If the user came from `/parse-workflow`, that skill produced a `handoff.json`
+file containing platform constants, parse outputs, and project metadata. Read
+it FIRST — it eliminates many questions in subsequent Discover steps.
+
+```bash
+# Look for handoff.json in the user's most recent parse-workflow work_dir.
+# Priority: explicit hint from user → state file → search common locations
+HANDOFF=""
+HANDOFF_HINT="${HANDOFF_PATH:-}"   # may be set by user invocation
+
+# Try state file from parse-workflow
+PW_STATE_DIR="$HOME/.claude/state/parse-workflow"
+if [[ -z "$HANDOFF_HINT" && -d "$PW_STATE_DIR" ]]; then
+    LATEST=$(ls -t "$PW_STATE_DIR"/*.json 2>/dev/null | head -1)
+    if [[ -n "$LATEST" ]]; then
+        WD=$(jq -r '.work_dir // empty' "$LATEST" 2>/dev/null)
+        [[ -n "$WD" && -f "$WD/handoff.json" ]] && HANDOFF="$WD/handoff.json"
+    fi
+fi
+
+# Fallback: explicit hint
+[[ -z "$HANDOFF" && -n "$HANDOFF_HINT" && -f "$HANDOFF_HINT" ]] && HANDOFF="$HANDOFF_HINT"
+
+if [[ -n "$HANDOFF" ]]; then
+    echo "📦 Found parse-workflow handoff: $HANDOFF"
+
+    # Validate (uses parse-workflow's bundled validator)
+    PW_DIR="$HOME/.claude/skills/parse-workflow"
+    [[ -d "$HOME/.claude/commands/parse-workflow" ]] && PW_DIR="$HOME/.claude/commands/parse-workflow"
+
+    if [[ -f "$PW_DIR/scripts/validate_handoff.py" ]]; then
+        VERDICT=$(python "$PW_DIR/scripts/validate_handoff.py" --handoff "$HANDOFF" --quiet \
+                  | jq -r '.verdict')
+        if [[ "$VERDICT" == "valid" || "$VERDICT" == "valid_with_warnings" ]]; then
+            # Pre-fill discovery vars from handoff — saves Phase 0.1 / 0.2 work
+            export ID_PLATFORM=$(jq -r '.id_platform' "$HANDOFF")
+            export PLATFORM=$(jq    -r '.platform'    "$HANDOFF")
+            export SOURCE_COUNTRY=$(jq -r '.source_country' "$HANDOFF")
+            export PARSE_WORK_DIR=$(jq -r '.work_dir' "$HANDOFF")
+            export REVERSE_PROJECT=$(jq -r '.source_dir' "$HANDOFF")
+            export HAS_FINDER=$(jq  -r '.has_finder'   "$HANDOFF")
+            export HAS_DETAIL=$(jq  -r '.has_detail'   "$HANDOFF")
+            export IS_SINGLE_ENDPOINT=$(jq -r '.is_single_endpoint' "$HANDOFF")
+
+            echo "✅ Handoff valid — pre-filled from parse-workflow:"
+            echo "    ID_PLATFORM:    $ID_PLATFORM"
+            echo "    PLATFORM:       $PLATFORM"
+            echo "    SOURCE_COUNTRY: $SOURCE_COUNTRY"
+            echo "    parse outputs:  $PARSE_WORK_DIR/parse/"
+            echo ""
+            echo "    Phase 0.1 (Understand source project) can SKIP analyzing the"
+            echo "    reverse project — that work is already done in $PARSE_WORK_DIR/doc/."
+            echo "    Use $PARSE_WORK_DIR/parse/scrapy_adapter.py as the parse contract."
+        else
+            echo "⚠️  handoff.json found but validation said: $VERDICT"
+            echo "    Proceeding without handoff pre-fill — full Phase 0 Discover required."
+            HANDOFF=""
+        fi
+    else
+        echo "ℹ️  parse-workflow validator not found — proceeding without handoff intake."
+        HANDOFF=""
+    fi
+else
+    echo "ℹ️  No parse-workflow handoff detected — full Phase 0 Discover required."
+fi
+```
+
+**If `$HANDOFF` is set**, downstream phases should:
+- Skip detailed reverse-engineering re-analysis (Phase 0.1 — peek at it but trust the parse-workflow `doc/` knowledge)
+- Reuse `$PARSE_WORK_DIR/parse/scrapy_adapter.py` as the parse layer (Phase 8/9 just need to wire it into the Scrapy spider)
+- Pre-fill `ID_PLATFORM`, `PLATFORM`, `SOURCE_COUNTRY` constants in Phase 5.3 / 8.0
+
+If `$HANDOFF` is empty, run Phase 0.05 + 0.1 + 0.2 normally — discovering everything from scratch.
+
+### 0.02 State directory (for end-of-flow checkpoint + cross-skill awareness)
+
+```bash
+export STATE_DIR="$HOME/.claude/state/conso-migrate"
+mkdir -p "$STATE_DIR"
+
+state_file() { echo "$STATE_DIR/${1}.json"; }   # keyed by ID_PLATFORM
+
+state_write() {
+    # Args: id_platform, step, extra_json
+    local f=$(state_file "$1")
+    local base='{}'
+    [[ -f "$f" ]] && base=$(cat "$f")
+    echo "$base" | jq \
+        --arg id_platform "$1" --arg step "$2" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson extra "${3:-{\}}" \
+        '. + {id_platform: $id_platform, last_step: $step, last_ts: $ts} + $extra' > "$f"
+}
+
+state_read() {
+    local f=$(state_file "$1")
+    [[ -f "$f" ]] && cat "$f" || echo "{}"
+}
+
+# Mark Phase 0 entry
+state_write "${ID_PLATFORM:-unknown}" "phase_0_started" \
+    "$(jq -n --arg h "$HANDOFF" '{handoff_path:$h}')"
+```
+
 ### 0.05 Peer Baseline Scan — architecture pattern reference
 
 > **Why:** the new platform's reverse-engineering requirements (TLS
@@ -1758,6 +1864,61 @@ Print a migration summary table:
 
 Migration complete — **{id_platform}** is now running on ConSo standard.
 For scheduling, see `docs/ConSo/en/03_ConSo_Schedule.md` in dashmote-sourcing.
+
+---
+
+## Persist State + Verdict-driven Next Steps
+
+Write the cross-skill state file so downstream skills (and future
+`/conso-migrate` resume) know this platform is migrated.
+
+```bash
+# Capture the migration verdict from Phase 12 + 12.5 + 15 outcomes
+MIGRATION_VERDICT="completed_clean"   # change to "completed_with_warnings" if any phase produced warnings
+[[ "${PHASE_12_5_GATE:-pass}" != "pass" ]] && MIGRATION_VERDICT="gated_blocked"
+
+# Persist
+state_write "$ID_PLATFORM" "completed" "$(jq -n \
+    --arg verdict     "$MIGRATION_VERDICT" \
+    --arg repo        "${REPO:-}" \
+    --arg github_org  "${GITHUB_ORG:-dashmote}" \
+    --arg country     "${SOURCE_COUNTRY:-}" \
+    --arg has_finder  "${HAS_FINDER:-yes}" \
+    --arg has_detail  "${HAS_DETAIL:-yes}" \
+    --arg parse_dir   "${PARSE_WORK_DIR:-}" \
+    '{verdict:$verdict, repo:$repo, github_org:$github_org, country:$country,
+      has_finder:$has_finder, has_detail:$has_detail,
+      parse_workflow_work_dir:$parse_dir}')"
+
+echo "📝 State persisted to $STATE_DIR/${ID_PLATFORM}.json"
+echo "    (downstream /conso-deploy and /run-detail can read this)"
+```
+
+**Verdict-driven Next Steps:**
+
+```
+✅ Migration complete for $ID_PLATFORM ($SOURCE_COUNTRY).
+
+Recommended next action — pick one:
+
+  1. Deploy to production AWS (ECR repo + EventBridge cron):
+     → /conso-deploy
+     (will auto-detect this platform from the state file we just wrote)
+
+  2. Sanity-test the spider locally (run a small Fargate task):
+     → /run-detail
+     (use sample=10 to crawl just a few outlets; confirm S3/MySQL writes work
+      before letting the monthly cron loose)
+
+  3. Stop here — manually review the generated code first
+     → Recommended if this is a complex platform; check Phase 5/8/9 outputs
+       and the AI Migration Declaration above before deploying.
+```
+
+If this migration was triggered from `/parse-workflow` (handoff was found in
+Phase 0.01), also note: "the parse-workflow `handoff.json` and state file are
+now stale references; you can keep them for audit but they're no longer
+load-bearing."
 
 ---
 
