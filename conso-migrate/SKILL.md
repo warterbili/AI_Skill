@@ -1,10 +1,3 @@
----
-name: conso-migrate
-description: "ConSo Migration Assistant. Migrate any crawler/scraper to ConSo standard end-to-end. Trigger words: conso, migrate, migration, spider, ConSo standard."
-disable-model-invocation: true
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
----
-
 # ConSo Migration Assistant
 
 Migrate ANY kind of crawler/scraper to ConSo standard end-to-end with maximum automation.
@@ -32,18 +25,18 @@ skill — **stop and explain the deviation to the user before proceeding**. Ask 
 explicit confirmation before applying any such fix.
 
 Helper scripts and templates live alongside this skill at:
-  ${CLAUDE_SKILL_DIR}/cass_insert.py
-  ${CLAUDE_SKILL_DIR}/mysql_migrate.py
-  ${CLAUDE_SKILL_DIR}/push_grids.py.template     ← filled per-platform in Phase 7
-  ${CLAUDE_SKILL_DIR}/schema_template.xlsx       ← ConSo field schema reference
-  ${CLAUDE_SKILL_DIR}/conso_outlet_finder.py.template
-  ${CLAUDE_SKILL_DIR}/conso_outlet_detail.py.template
-  ${CLAUDE_SKILL_DIR}/pyproject.toml.template
-  ${CLAUDE_SKILL_DIR}/ECR.yml.template
-  ${CLAUDE_SKILL_DIR}/Dockerfile.template
-  ${CLAUDE_SKILL_DIR}/check_mongodb.py         ← inspects MongoDB collections after local test (Phase 12)
+  ~/.claude/commands/conso-migrate/cass_insert.py
+  ~/.claude/commands/conso-migrate/mysql_migrate.py
+  ~/.claude/commands/conso-migrate/push_grids.py.template     ← filled per-platform in Phase 7
+  ~/.claude/commands/conso-migrate/schema_template.xlsx       ← ConSo field schema reference
+  ~/.claude/commands/conso-migrate/conso_outlet_finder.py.template
+  ~/.claude/commands/conso-migrate/conso_outlet_detail.py.template
+  ~/.claude/commands/conso-migrate/pyproject.toml.template
+  ~/.claude/commands/conso-migrate/ECR.yml.template
+  ~/.claude/commands/conso-migrate/Dockerfile.template
+  ~/.claude/commands/conso-migrate/check_mongodb.py         ← inspects MongoDB collections after local test (Phase 12)
 
-Run them with `poetry run python ${CLAUDE_SKILL_DIR}/<script>.py --help`
+Run them with `poetry run python ~/.claude/commands/conso-migrate/<script>.py --help`
 to see all available options.
 
 **Leave no trace.** Every file generated purely as an intermediate step must be deleted
@@ -116,6 +109,24 @@ testing — this allows automatic data inspection after each test run.
 
 ---
 
+## Cross-phase Invariants — one place, all the couplings
+
+These are contracts that span multiple phases. A decision in Phase A fails
+silently if Phase B doesn't hold up its end. Check these proactively, not reactively.
+
+| # | Invariant | Set in | Verified in | Symptom if broken |
+|---|---|---|---|---|
+| I1 | `DB = PLATFORM` in settings.py | Phase 5.3 | Phase 12.0 Gate G1 | 0 MySQL writes, no errors (YDE/LMN 2026-04-13) |
+| I2 | Finder `FeedItem.tablename` matches scrapyd's `RDSPipeline` filter | Phase 8.0 (hardcoded `"outlet_feeds"`) | Phase 12.5 Gate G2 (MySQL growth 15 min post-deploy) | scraped N, 0 MySQL writes |
+| I3 | `FeedItem` declared fields ⊆ MySQL table columns | Phase 8.0 + Phase 6 | First `Inserted/Updated` log in Phase 13.5 | `Unknown column` pymysql error |
+| I4 | `PreprocessPipeline` enabled ⟹ QA validation sheet exists | Phase 9 | Phase 12.0 Gate G4 | `FileNotFoundError` on detail spider start |
+| I5 | ECR image commit ≥ last working-tree commit | Phase 15 | Phase 12.0 Gate G3 | Fargate runs stale code |
+| I6 | HTTP is via `yield scrapy.Request` (Hard Rule R1) | Phase 8.1 / 9 | Phase 12 Step 1 check `Crawled N pages > 0` | `Crawled 0 pages` while items grow (YDE finder 60h) |
+
+If a downstream Gate fails, the upstream phase did something wrong — **fix the source**, don't patch around it.
+
+---
+
 ## Phase 0 — Preflight & Discover
 
 ### 0.0 AWS MFA authentication
@@ -141,6 +152,41 @@ bash /path/to/get_session_token.sh
 
 Wait for the user to confirm credentials are active before continuing.
 Re-run `aws sts get-caller-identity` to confirm.
+
+### 0.05 Peer Baseline Scan — architecture pattern reference
+
+> **Why:** the new platform's reverse-engineering requirements (TLS
+> impersonation? residential proxy? special headers?) are almost always
+> matched by an existing peer. Copying a proven architecture saves hours
+> vs. deriving one. This is for **architecture choices**, NOT for looking
+> up fixed values like `tablename` or `DB` (those are hardcoded in
+> Phase 5.3 / 8.0 already).
+
+Scan peer projects for middleware and proxy patterns:
+
+```bash
+for p in ~/projects/*/; do
+    name=$(basename "$p")
+    [ "$name" = "{id_platform}" ] && continue
+    finder=$(find "$p" -name "conso_outlet_finder.py" -not -path "*/.venv/*" 2>/dev/null | head -1)
+    [ -z "$finder" ] && continue
+    echo "=== $name ==="
+    grep -E "ITEM_PIPELINES|tls_client|curl_cffi|IMPERSONATE|MixProxies|BrightData|DynamicProxies|StaticProxy" "$finder" | head -5
+done
+```
+
+**Reference matrix (known peers as of 2026-04):**
+
+| Peer | Reverse-eng challenge | Solution |
+|---|---|---|
+| IFD (iFood, BR) | Data-center IP blocks | BrightData residential proxy (`DynamicProxiesMiddleware`) — no TLS work needed |
+| TKW (Thuisbezorgd, EU) | TLS fingerprint | `TlsClientDownloaderMiddleware` @ 301 + `StaticProxy` |
+| DLR (Deliveroo, ME/EU) | TLS fingerprint | `TlsClientDownloaderMiddleware` + `MixProxiesMiddleware` |
+| JSE (Just Eat, EU) | Mild | `StaticProxy` only |
+| YDE (Yandex, RU) | TLS fingerprint (Yandex blocks non-browser TLS) | project-local `CurlCffiImpersonateMiddleware` @ 800 |
+
+**Decision rule**: if the new platform's reverse-engineering shape matches a
+peer, copy that peer's middleware setup. Deviate only with a written rationale.
 
 ### 0.1 Understand the source project
 
@@ -322,7 +368,7 @@ If neither source yields a token, print this one manual step and wait:
 ```
 
 ### 2.3 Generate .github/workflows/ECR.yml
-Read `${CLAUDE_SKILL_DIR}/ECR.yml.template` and copy it as-is to
+Read `~/.claude/commands/conso-migrate/ECR.yml.template` and copy it as-is to
 `.github/workflows/ECR.yml` — no variable substitution needed (the workflow derives
 all values at runtime from the repository context).
 
@@ -347,7 +393,7 @@ known after push_grids.py has run.
 **If there is no finder stage** (detail-only platform): run now with defaults:
 
 ```bash
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} \
     --prefixes {prefixes_comma_separated} \
     --email {maintainer_email} \
@@ -356,7 +402,7 @@ poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
 
 To override table list or concurrency (only if the user explicitly requests it):
 ```bash
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} \
     --prefixes {prefixes_comma_separated} \
     --email {maintainer_email} \
@@ -372,7 +418,7 @@ poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
 If `pyproject.toml` already has `dashmote-sourcing` as a dependency and name is
 `{id_platform}`, skip.
 
-Otherwise read `${CLAUDE_SKILL_DIR}/pyproject.toml.template`,
+Otherwise read `~/.claude/commands/conso-migrate/pyproject.toml.template`,
 replace the placeholders below, and write the result to `pyproject.toml`:
 
 | Placeholder | Value |
@@ -412,7 +458,7 @@ project = {id_platform}
 
 ### 5.3 Replace settings.py
 
-Read `${CLAUDE_SKILL_DIR}/settings.py.template`.
+Read `~/.claude/commands/conso-migrate/settings.py.template`.
 Replace the two placeholders and write the result to `{id_platform}/settings.py`,
 **overwriting** the existing file:
 
@@ -432,6 +478,13 @@ signing keys, etc.), preserve them by appending below the template content.
 Remove from the old file if carried over: `CONCURRENT_REQUESTS`,
 `CONCURRENT_REQUESTS_PER_DOMAIN`, `DOWNLOAD_DELAY`, manual Redis config,
 manual Prometheus port.
+
+**`DB = PLATFORM` is MANDATORY** — the template already has it. If you edit
+settings.py for any reason, never remove this line. scrapyd's `RDSPipeline`
+does `self.db_name = self.settings.get("DB")` with no fallback; missing `DB` →
+`db_name=None` → **every MySQL write silently fails with zero error logs**
+while `scraped_count` keeps rising. (YDE/LMN 2026-04-13 incident: 13+ days of
+silent data loss from this single missing line.)
 
 ### 5.3-post (deferred to end of Phase 8.0) — Finalise MongoDBPipeline imports
 
@@ -493,7 +546,7 @@ Run `mysql_migrate.py`. Use `--dry-run` first to confirm what will be migrated.
 
 ```bash
 # Dry run first
-poetry run python ${CLAUDE_SKILL_DIR}/mysql_migrate.py \
+poetry run python ~/.claude/commands/conso-migrate/mysql_migrate.py \
     --id-platform {id_platform} \
     --orig-db {original_database_name} \
     --orig-table {original_table_name} \
@@ -503,7 +556,7 @@ poetry run python ${CLAUDE_SKILL_DIR}/mysql_migrate.py \
     --dry-run
 
 # Run for real
-poetry run python ${CLAUDE_SKILL_DIR}/mysql_migrate.py \
+poetry run python ~/.claude/commands/conso-migrate/mysql_migrate.py \
     --id-platform {id_platform} \
     --orig-db {original_database_name} \
     --orig-table {original_table_name} \
@@ -619,7 +672,7 @@ Production grids must be properly generated via `grids_gen` before any real run.
 
 ### 7.1 Generate push_grids.py
 
-Read `${CLAUDE_SKILL_DIR}/push_grids.py.template`.
+Read `~/.claude/commands/conso-migrate/push_grids.py.template`.
 Replace the placeholders and write the result to `scripts/push_grids.py`.
 Create the `scripts/` directory if it does not exist.
 
@@ -688,7 +741,7 @@ uses one consistent key suffix, e.g. `"3000_grid"`). Take that `key_suffix` valu
 directly and pass it as `--finder-geo-distance`.
 
 ```bash
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} \
     --prefixes {prefixes_comma_separated} \
     --email {maintainer_email} \
@@ -701,7 +754,7 @@ separately for each group.
 
 To override table list or concurrency (only if the user explicitly requests it):
 ```bash
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} \
     --prefixes {prefixes_comma_separated} \
     --email {maintainer_email} \
@@ -717,199 +770,128 @@ poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
 
 ### 8.0 Ensure items.py exists in the project
 
-The spider templates import from `{id_platform}.items`, NOT from `dashmote_sourcing.items`.
+Spider templates import from `{id_platform}.items`, NOT `dashmote_sourcing.items`.
 
-**Step 1 — Read and validate the existing items.py.**
+**Contract — `tablename` values route items through scrapyd's RDSPipeline filter:**
 
-If `{id_platform}/items.py` already exists, read it completely and validate:
-
-- Each class must use `tablename = "..."` (not `table_name`) as the class attribute.
-  `tablename` is what `S3Pipeline` and `PreprocessPipeline` read at runtime.
-- `tablename` values must match ConSo standard: `"outlet_information"`, `"outlet_meal"`,
-  `"meal_option"`, `"option_relation"`, `"outlets"`.
-If any of these checks fail — wrong attribute name (`table_name`) or wrong table value
-(e.g. `"outlet_feeds"`) — **rewrite the file** from the ConSo standard template below
-rather than trying to patch individual issues.
-Announce the problem and the fix to the user before rewriting.
-
-If the existing items.py passes validation, map actual class names to their ConSo roles:
-
-| ConSo role | Required `tablename` value | Actual class name in this project |
-|---|---|---|
-| outlet finder output | `"outlets"` | `{actual_feed_class}` |
-| outlet detail | `"outlet_information"` | `{actual_outlet_class}` |
-| meal | `"outlet_meal"` | `{actual_meal_class}` |
-| option | `"meal_option"` | `{actual_option_class}` |
-| relation | `"option_relation"` | `{actual_relation_class}` |
-
-Class names are irrelevant — only `tablename` values must match exactly.
-Use the actual class names throughout Phases 8 and 9 in all imports and `yield` calls.
-
-**Step 2 — Create items.py if it does not exist or was invalid.**
-
-For projects with no items file, or where the existing file failed validation above,
-write `{id_platform}/items.py` using the full ConSo standard field set.
-
-**Class names can be anything** (they vary per project). What must be correct is the
-`tablename` attribute value on each class. The pipeline routes items by `tablename`,
-so a wrong value (e.g. `"outlet_feeds"` instead of `"outlets"`) causes silent MySQL
-write failures. The required values are fixed:
-
-| Class role | Required `tablename` value |
+| Role | Required `tablename` |
 |---|---|
-| finder feed output | `"outlets"` |
+| finder feed output | `"outlet_feeds"` |
 | outlet detail | `"outlet_information"` |
 | meal | `"outlet_meal"` |
 | option | `"meal_option"` |
 | relation | `"option_relation"` |
 
-```python
-import scrapy
+> **Why these exact strings:** scrapyd container's `RDSPipeline.process_item`
+> hard-filters items by `tablename`. Wrong value = silent MySQL drop, no
+> errors, `scraped_count` still rises. Current values verified via
+> DiagnosticSpider (Phase 11.5) 2026-04-13 against scrapyd running
+> `dashmote_sourcing 2.1.1`. If Gate G2 (MySQL growth 15 min post-deploy)
+> fails, scrapyd may have been upgraded and these values changed — run
+> Phase 11.5 to re-probe. See Appendix A1.
 
+Class names are irrelevant — only `tablename` values matter.
 
-class OutletItem(scrapy.Item):
-    tablename = "outlet_information"
+**If `{id_platform}/items.py` already exists:** validate each class uses
+`tablename = "..."` (not `table_name`) and values match the table above.
+Wrong value = rewrite from `items.py.template`; announce the fix before doing it.
 
-    id_outlet = scrapy.Field()
-    id_platform = scrapy.Field()
-    name = scrapy.Field()
-    address = scrapy.Field()
-    street = scrapy.Field()
-    house_number = scrapy.Field()
-    postal_code = scrapy.Field()
-    city = scrapy.Field()
-    region = scrapy.Field()
-    country = scrapy.Field()
-    source_country = scrapy.Field()
-    lat = scrapy.Field()
-    lon = scrapy.Field()
-    telephone = scrapy.Field()
-    url = scrapy.Field()
-    website = scrapy.Field()
-    platform = scrapy.Field()
-    source = scrapy.Field()
-    rating = scrapy.Field()
-    review_nr = scrapy.Field()
-    price_level = scrapy.Field()
-    cuisine = scrapy.Field()
-    category = scrapy.Field()
-    is_new = scrapy.Field()
-    pickup_available = scrapy.Field()
-    delivery_available = scrapy.Field()
-    id_chain = scrapy.Field()
-    chain_name = scrapy.Field()
-    banner_img_url = scrapy.Field()
-    description = scrapy.Field()
-    opening_hours = scrapy.Field()
-    closed = scrapy.Field()
-    currency = scrapy.Field()
+**If items.py doesn't exist / was invalid:** copy
+`~/.claude/commands/conso-migrate/items.py.template` to `{id_platform}/items.py`.
+Delete Item classes this platform doesn't collect.
 
-
-class MealItem(scrapy.Item):
-    tablename = "outlet_meal"
-
-    id_outlet = scrapy.Field()
-    id_meal = scrapy.Field()
-    id_category = scrapy.Field()
-    id_menu = scrapy.Field()
-    id_platform = scrapy.Field()
-    name = scrapy.Field()
-    description = scrapy.Field()
-    category = scrapy.Field()
-    category_description = scrapy.Field()
-    menu = scrapy.Field()
-    price = scrapy.Field()
-    image_url = scrapy.Field()
-    position = scrapy.Field()
-    sold_out = scrapy.Field()
-    popular = scrapy.Field()
-    is_alcohol = scrapy.Field()
-    feature = scrapy.Field()
-    choices = scrapy.Field()
-    platform = scrapy.Field()
-    source = scrapy.Field()
-    meal_id = scrapy.Field()
-    menu_id = scrapy.Field()
-    popup_id = scrapy.Field()
-
-
-class OptionItem(scrapy.Item):
-    tablename = "meal_option"
-
-    id_outlet = scrapy.Field()
-    id_option = scrapy.Field()
-    id_platform = scrapy.Field()
-    name = scrapy.Field()
-    description = scrapy.Field()
-    category = scrapy.Field()
-    price = scrapy.Field()
-    platform = scrapy.Field()
-
-
-class RelationItem(scrapy.Item):
-    tablename = "option_relation"
-
-    id_outlet = scrapy.Field()
-    id_meal = scrapy.Field()
-    id_option = scrapy.Field()
-    id_option_parent = scrapy.Field()
-    id_platform = scrapy.Field()
-    option_level = scrapy.Field()
-    platform = scrapy.Field()
-
-
-class FeedItem(scrapy.Item):
-    tablename = "outlets"
-
-    id_outlet = scrapy.Field()
-
-
-__all__ = [
-    'OutletItem',
-    'MealItem',
-    'OptionItem',
-    'RelationItem',
-    'FeedItem',
-]
-```
-
-Only include Item classes that this platform actually collects.
+**Phase 8.0 Exit Checkpoint:**
+- [ ] Invariant I2 satisfied: `FeedItem.tablename` matches scrapyd filter
+      (confirmed via Phase 0.05 peer matrix or Phase 11.5 `.scrapyd_baseline.md`)
+- [ ] Invariant I3 satisfied: `FeedItem` declared fields are a subset of the
+      MySQL `{id_platform}.{prefix}` table columns (Phase 6 schema)
 
 ### 8.1 Write the finder spider
 
-Read `${CLAUDE_SKILL_DIR}/conso_outlet_finder.py.template`.
+Read `~/.claude/commands/conso-migrate/conso_outlet_finder.py.template`.
 Replace `{{ID_PLATFORM}}` with `{id_platform}`, then write the result to
 `{id_platform}/spiders/conso_outlet_finder.py`.
 
-**Adaptation by source type:**
+**🛑 ConSo Spider Hard Rules — read these before porting ANY source code.**
 
-- **Scrapy spider**: port `start_requests` / `parse` directly into the template.
-- **requests / httpx / tls_client / curl_cffi script**: wrap each call as a
-  `scrapy.Request` + callback, or use `RequestHelper` for complex session state.
-- **Selenium / Playwright / nodriver**: use `scrapy-playwright` middleware;
-  yield `scrapy.Request` with `meta={"playwright": True}`.
-- **Notebook / ad-hoc script**: extract the core discovery loop; drop all
-  manual setup (Redis init, logging config) — BaseSpider handles it.
-- **Postman collection** (`*.postman_collection.json`): parse the collection
-  to extract the discovery request(s) — URL template, method, headers, body.
-  Reconstruct as `scrapy.Request` calls inside `start_requests`.
-  For auth flows (OAuth, API key pre-request scripts), port the logic explicitly.
-- **Bruno collection** (`*.bru` / `collection.bru`): same as Postman — parse
-  the `.bru` text format (INI-like) to extract URL, method, headers, body, and
-  auth sections; reconstruct as Scrapy requests.
-- **HAR file** (`*.har`): extract the relevant GET/POST requests from the JSON,
-  convert headers/body to `scrapy.Request` arguments.
-- **curl commands** (`curl_*.sh` or inline): convert each curl to a
-  `scrapy.Request` (map `-H` to `headers`, `--data` to `body`, `-X` to `method`).
-- **Non-Python language** (JS/Go/Java/Ruby/…): read the source to understand the
-  request shape (URL, method, headers, body, auth), then re-implement it in Python
-  using `scrapy.Request`; preserve all headers and auth logic exactly.
+These rules are non-negotiable. Violating any of them caused the YDE 2026-04
+incident (60-hour silent data loss in production despite local tests passing —
+see Phase 13.5 post-mortem).
+
+| Rule | ❌ Forbidden pattern | ✅ Required pattern |
+|---|---|---|
+| **R1 — All HTTP via Scrapy Downloader** | `requests.get(...)`, `httpx.post(...)`, `curl_cffi.Session(...).post(...)`, `tls_client.Session().execute_request(...)`, raw `urllib.request` calls inside any spider method | `yield scrapy.Request(url, method, body, headers, callback=self.parse_xxx, meta={...})` |
+| **R2 — Items in callbacks only** | `yield FeedItem(...)` inside `start_requests()` | `start_requests()` yields Requests; the callback `parse_xxx(self, response)` yields Items |
+| **R3 — No reactor blocking** | `time.sleep(N)`, `requests_cache`, any sync IO wrapped in a loop | `DOWNLOAD_DELAY` + `CONCURRENT_REQUESTS` in `custom_settings`; Scrapy schedules naturally |
+| **R4 — Helpers are instance methods** | Free functions at module scope that handle request building / parsing | Methods on the spider class (`def _build_request(self, …)`, `def parse_menu(self, response)`) |
+| **R5 — No manual pipeline substitutes** | Writing to MySQL / S3 / Mongo inline in a callback | Yield Items; let the declared `ITEM_PIPELINES` handle persistence |
+
+**Why R1+R2 matter (YDE incident root cause):** items produced in
+`start_requests` bypass Scrapy's normal `response` → `callback` → `item_scraped`
+flow and instead go through `scraper.start_itemproc(item, response=None)`. The
+`dashmote_sourcing.RDSPipeline` version frozen in SpiderKeeper's scrapyd
+container silently drops items on this path — no exceptions, no warnings, just
+zero MySQL writes while Scrapy's `scraped_count` keeps ticking up.
+
+**TLS fingerprint spoofing** (for platforms that block the default Scrapy TLS
+fingerprint — Yandex Eats, iFood, DoorDash, etc.): use the `scrapy-impersonate`
+download handler (already wired in the generated `settings.py` from Phase 5.3).
+
+```python
+# In the spider class:
+IMPERSONATE = 'chrome110'    # curl_cffi profile; pick closest to what the source used
+
+# In start_requests / a callback:
+yield scrapy.Request(
+    url=...,
+    method="POST",
+    body=json.dumps(payload),
+    headers={
+        "User-Agent": "Mozilla/5.0 ... Chrome/110.0.0.0 Safari/537.36",  # always include!
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en,…",
+        "Content-Type": "application/json",
+        "Origin":  self.BASE_URL,
+        "Referer": f"{self.BASE_URL}/",
+        # platform-specific headers
+    },
+    callback=self.parse_grid,
+    meta={"impersonate": self.IMPERSONATE, "grid": grid},
+)
+```
+
+Header note: `scrapy-impersonate` does NOT auto-inject a browser User-Agent —
+Scrapy's default `UserAgentMiddleware` will insert `Scrapy/2.x.x` unless you
+override. **Always set `User-Agent` matching the impersonate profile in your
+request headers**, otherwise the target will 403 you even with chrome110 TLS.
+
+**Adaptation by source type — every source maps to the classic Request path:**
+
+| Source | Mapping |
+|---|---|
+| **Scrapy spider** | Port `start_requests` / `parse` directly into the template (already classic path). |
+| **`requests` / `httpx` script** | Each `session.get/post(...)` becomes a `yield scrapy.Request(url, callback=self.parse_xxx, meta={...})`. The callback receives the response. Session cookies are auto-handled by Scrapy's `CookiesMiddleware`. |
+| **`curl_cffi` / `tls_client` with impersonation** | Same as above + set `self.IMPERSONATE = '<profile>'` and include `meta['impersonate']=self.IMPERSONATE`. This routes the Request through `scrapy-impersonate` which uses curl_cffi under the hood — same TLS fingerprint, but now inside Scrapy's Downloader. |
+| **Selenium / Playwright / nodriver** | Use `scrapy-playwright`; yield `scrapy.Request(url, meta={"playwright": True, "playwright_page_methods": [...]})`. |
+| **Notebook / ad-hoc script** | Extract only the discovery loop logic; drop manual Redis init, session setup, logging config — BaseSpider handles those. Wrap each HTTP call as a Request yield. |
+| **Postman `.postman_collection.json`** | Parse the JSON, extract URL template / method / headers / body / auth for each discovery request. Reconstruct as `scrapy.Request(...)` calls in `start_requests`. Port OAuth / API-key pre-request scripts as instance helper methods on the spider. |
+| **Bruno `.bru` / `collection.bru`** | Same as Postman — read the INI-like format and reconstruct each request as a `scrapy.Request`. |
+| **HAR file `*.har`** | Extract relevant GET/POST entries from `log.entries[].request`, map to `scrapy.Request` args (URL, method, headers, postData). |
+| **`curl` commands** | Convert each curl to a `scrapy.Request`: `-H` → `headers`, `--data` → `body`, `-X` → `method`, `-b` → `meta['cookiejar']`. |
+| **Non-Python language** (JS/Go/Java/Ruby) | Read the source to understand request shape; re-implement the request in Python as a `scrapy.Request`, preserving headers / auth logic / body serialization exactly. |
+
+**Whatever the source was, the output MUST be a spider where:**
+1. `start_requests()` only yields `scrapy.Request` objects (never items).
+2. Every HTTP touch happens inside a callback-yielded Request.
+3. Multi-step flows (e.g. auth → list → detail) are chains of callbacks
+   passing state via `request.meta`.
 
 **ConSo finder contract (required in all cases):**
-- Grid/area data comes from Redis (populated by `push_grids.py` in Phase 7)
+- Grid/area data comes from Redis (populated by `push_grids.py` in Phase 7).
 - `self.redis_client.pop_and_push_grid` / `check_round` drives the outer loop
-- Discovered outlet IDs are yielded as `RDS_PIPELINE` items using the actual finder
-  output class identified in Phase 8.0 (the one with `tablename = "outlets"`)
+  inside `start_requests`, yielding one Request per grid.
+- Discovered outlet IDs are yielded as `FeedItem` from the `parse_grid` callback,
+  not from `start_requests`.
 - **`country` is NOT required** — RDSPipeline uses `spider.prefix` as the MySQL
   table name directly; it never reads `item['country']`. Do not add a `country` field
   to the finder item unless the source project already uses it for other purposes.
@@ -931,7 +913,7 @@ manual Prometheus port setup.
 
 **Parse logic when no parsing exists** (Postman / Bruno / capture-only project):
 If no outlet-parsing code was found, generate it by cross-referencing the response
-against `${CLAUDE_SKILL_DIR}/schema_template.xlsx` (sheet `outlet_information`).
+against `~/.claude/commands/conso-migrate/schema_template.xlsx` (sheet `outlet_information`).
 Map each response field whose name or semantics matches a ConSo field.
 Mark uncertain mappings with `# TODO: verify field mapping`.
 
@@ -964,6 +946,14 @@ self.redis = RedisDriver(test=True)   # always use test Redis for token pool
 
 Remove `test=True` before deploying to production.
 
+**Phase 8.1 Exit Checkpoint:**
+- [ ] Invariant I6 satisfied: all HTTP goes through `yield scrapy.Request`;
+      verify by reading the finder — no `requests.get` / `httpx` / `curl_cffi.Session`
+      calls inside any spider method, no `yield FeedItem(...)` inside `start_requests`.
+- [ ] If platform needs TLS impersonation: `self.IMPERSONATE` set AND either
+      `scrapy-impersonate` confirmed in scrapyd (Phase 11.5 baseline) or a
+      project-local DownloaderMiddleware wraps `curl_cffi`/`tls_client`.
+
 ---
 
 ## Phase 9 — Migrate detail_spider
@@ -975,36 +965,62 @@ meal_option, option_relation). If spread across multiple files, consolidate into
 placeholder names. The import line in the detail spider must reference whatever
 classes actually exist in `{id_platform}/items.py`.
 
-Read `${CLAUDE_SKILL_DIR}/conso_outlet_detail.py.template`.
+Read `~/.claude/commands/conso-migrate/conso_outlet_detail.py.template`.
 Replace `{{ID_PLATFORM}}` with `{id_platform}`, then write the result to
 `{id_platform}/spiders/conso_outlet_detail.py`.
 
-**Adaptation by source type:**
+**🛑 The same Hard Rules (R1–R5) from Phase 8.1 apply here — re-read them before porting.**
+The YDE incident affected both finder AND detail; any direct curl_cffi / requests
+call inside the detail spider will silently break `S3Pipeline` and / or
+`PreprocessPipeline` the same way it broke `RDSPipeline`.
 
-- **Scrapy spider**: port request chains and parse callbacks directly.
-- **requests / httpx / tls_client / curl_cffi script**: each `session.get/post()`
-  becomes a `scrapy.Request` yield; use `RequestHelper` for complex session state.
-- **Selenium / Playwright / nodriver**: use `scrapy-playwright` middleware;
-  yield `scrapy.Request` with `meta={"playwright": True, "playwright_page_methods": […]}`.
-- **Notebook / ad-hoc script**: extract per-outlet request/parse logic into
-  `start_requests` + `parse`; the outer loop is replaced by the Redis queue.
-- **Postman collection**: parse every request in the collection that looks like an
-  outlet-detail call. Reconstruct headers, body, and auth as `scrapy.Request` args.
-  Chain callbacks for multi-request flows (e.g. auth → detail → meal).
-- **Bruno collection**: same as Postman — read `.bru` request files (vars, headers,
-  body, auth sections) and port each request into a Scrapy callback chain.
-- **HAR file**: extract detail-page requests (filter by URL pattern or response
-  content-type); convert to `scrapy.Request` with exact headers/body reproduced.
-- **curl commands**: convert to `scrapy.Request` (map `-H`, `--data`, `-X`, `-b`).
-- **Non-Python language**: re-implement the HTTP requests in Python, preserving
-  headers, auth logic, and any signing/encoding exactly. Do not omit headers —
-  platforms enforce fingerprinting.
+**Multi-step request chains are expressed as callbacks passing state via `meta`:**
+
+```python
+def start_requests(self):
+    self.filter(recrawl=self.recrawl)
+    self.metadata = self.load_metadata()
+    while self.redis_client.count_set(self.db_key):
+        id_outlet = self.redis_client.pop_from_set(self.db_key)
+        if not self.get_metadata(id_outlet):
+            continue
+        meta = {"id_outlet": id_outlet}
+        if self.IMPERSONATE:
+            meta['impersonate'] = self.IMPERSONATE
+        yield scrapy.Request(catalog_url, callback=self.parse_catalog, meta=meta)
+
+def parse_catalog(self, response):
+    id_outlet = response.meta['id_outlet']
+    yield OutletItem(...)   # item goes to S3Pipeline
+    # Chain the next request; pass state via meta
+    meta = {"id_outlet": id_outlet}
+    if self.IMPERSONATE:
+        meta['impersonate'] = self.IMPERSONATE
+    yield scrapy.Request(menu_url, callback=self.parse_menu, meta=meta)
+
+def parse_menu(self, response):
+    for meal in ...:
+        yield MealItem(...)
+```
+
+**Adaptation by source type — same principle as Phase 8.1:**
+
+| Source | Mapping |
+|---|---|
+| **Scrapy spider** | Port request chains + parse callbacks directly. |
+| **`requests` / `httpx` script** | Each `session.get/post()` → `yield scrapy.Request(...)`; chain multi-step flows through callbacks + `meta`. |
+| **`curl_cffi` / `tls_client` with impersonation** | Same as above + set `self.IMPERSONATE = '<profile>'` and add `meta['impersonate'] = self.IMPERSONATE` to every yielded Request. |
+| **Selenium / Playwright / nodriver** | `scrapy-playwright`; `meta={"playwright": True, "playwright_page_methods": [...]}`. |
+| **Notebook / ad-hoc script** | Extract per-outlet request/parse logic into `start_requests` + `parse_xxx` callbacks; the outer per-outlet loop is replaced by Redis queue popping. |
+| **Postman / Bruno / HAR / curl** | Parse the source format, reconstruct each request as `scrapy.Request`; chain multi-step flows as callbacks. |
+| **Non-Python language** | Re-implement each HTTP request in Python as `scrapy.Request`; preserve headers / auth / body serialization exactly (platforms enforce fingerprinting). |
 
 **ConSo detail notes:**
 - `self.filter()` replaces all manual queue-filling and dedup logic
 - `self.get_metadata(id_outlet)` replaces manual DB/file lookups
 - Remove all manual S3/MySQL write logic — `PREPROCESS_PIPELINE` + `S3_PIPELINE` handle it
 - Remove manual proxy setup — `STATIC_PROXY_MIDDLEWARE` / `DYNAMIC_PROXY_MIDDLEWARE` handle it
+- For TLS impersonation see Phase 8.1; the same `self.IMPERSONATE` + `meta['impersonate']` pattern applies
 
 **Request/parse methods must live inside the spider class:**
 All helper methods (`_build_request`, `_get_token`, `_sign`, `parse_meals`, etc.)
@@ -1017,7 +1033,7 @@ If no Python parse logic was found, auto-generate it using this process:
 
 1. Find the best available response sample — notebook cell output, `.json` fixture
    files, HAR response bodies, or Postman/Bruno example responses.
-2. Use `${CLAUDE_SKILL_DIR}/schema_template.xlsx` as field reference.
+2. Use `~/.claude/commands/conso-migrate/schema_template.xlsx` as field reference.
    Each sheet has columns: Field / Type / Index / Must / Description / Example / If absent.
 3. For each table in scope:
    a. Traverse the response JSON and match keys by name or semantics to ConSo fields.
@@ -1087,7 +1103,7 @@ If no Python parse logic was found, auto-generate it using this process:
 
 ## Phase 10 — Generate Dockerfile
 
-Read `${CLAUDE_SKILL_DIR}/Dockerfile.template`.
+Read `~/.claude/commands/conso-migrate/Dockerfile.template`.
 Replace `{{ID_PLATFORM}}` with `{id_platform}`, then write the result to `Dockerfile`
 in the project root.
 
@@ -1172,38 +1188,91 @@ aws logs put-retention-policy \
 
 ---
 
+## Phase 11.5 — DiagnosticSpider (diagnostic tool, not mandatory step)
+
+> **When to use**: you do NOT run this on every migration. Run it only when:
+> - Gate G2 fails post-deploy (MySQL writes don't grow 15 min after finder launch)
+> - Gate G4 behaves unexpectedly (PreprocessPipeline errors)
+> - You suspect scrapyd container has been upgraded (hardcoded values in
+>   Phase 8.0 no longer match reality)
+> - You're the first migration after a known dashmote_sourcing bump
+>
+> **When to skip**: normal migrations. The values in Phase 8.0 `tablename`
+> table and `DB = PLATFORM` are the current truth. If Gate G2 confirms MySQL
+> writes within 15 minutes, you don't need to probe.
+>
+> **Why keep this tool at all**: when things break, guessing wastes days.
+> DiagnosticSpider gives you scrapyd's actual `RDSPipeline` source, package
+> list, and `dashmote_sourcing` version in 5 seconds. YDE 2026-04-13 spent
+> hours guessing before running it — that's the pattern to avoid.
+
+### 11.5.1 Create the probe spider (only when needed)
+
+Place at `{id_platform}/spiders/diagnostic.py`:
+
+```python
+import sys, platform, inspect
+from importlib.metadata import distributions
+from scrapy import Spider
+
+class DiagnosticSpider(Spider):
+    """One-shot scrapyd env probe. Dumps python + pip freeze + RDSPipeline source."""
+    name = "diagnostic"
+    custom_settings = {"ITEM_PIPELINES": {}, "CLOSESPIDER_TIMEOUT": 5}
+
+    def start_requests(self):
+        self.logger.info(f"PROBE> python={sys.version}  platform={platform.platform()}")
+        for d in sorted(distributions(), key=lambda d: d.metadata['name']):
+            self.logger.info(f"PROBE> PKG {d.metadata['name']}=={d.version}")
+        try:
+            from dashmote_sourcing.pipelines.mysql_pipeline import RDSPipeline
+            for i, line in enumerate(inspect.getsource(RDSPipeline).split('\n'), 1):
+                self.logger.info(f"PROBE> RDS L{i:3}: {line}")
+        except Exception as e:
+            self.logger.error(f"PROBE> RDSPipeline import failed: {e}")
+        return []
+```
+
+### 11.5.2 Deploy and run once
+
+Build `.egg`, upload to SpiderKeeper (Phase 13.1-13.4 short path), Schedule
+the `diagnostic` spider with no parameters. Runs for ~5 seconds.
+
+### 11.5.3 Record baseline in `{id_platform}/.scrapyd_baseline.md`
+
+Grep `PROBE>` from the log and capture:
+
+```markdown
+# scrapyd container baseline (recorded YYYY-MM-DD)
+
+## Python
+3.X.Y
+
+## Key packages
+- dashmote_sourcing==X.Y.Z
+- curl_cffi==A.B.C            (use for TLS impersonation, scrapy-impersonate NOT installed)
+- tls-client==D.E.F            (alternative TLS library, TKW/DLR pattern)
+
+## RDSPipeline key lines
+- L21: self.item_tablename = ['outlet_feeds']   ← tablename FILTER
+- L24: self.db_name = self.settings.get("DB")   ← NO fallback — `DB = PLATFORM` mandatory
+- L19: bucketsize = ... MYSQL_ITEM_SIZE default 8000
+
+## Verdict
+- FeedItem.tablename MUST be 'outlet_feeds' (confirmed by L21 filter list)
+- settings.py MUST have `DB = PLATFORM` (confirmed by L24 no-fallback)
+- For TLS: use curl_cffi via project-local middleware (scrapy-impersonate absent)
+```
+
+This file feeds Gate G2 and G5 in Phase 12.0.
+
+---
+
 ## Phase 12 — Local Validation
 
 **Always run finder before detail** — detail's `filter()` reads outlet IDs from MySQL.
 On a new platform with an empty MySQL database there are no rows to read, so detail
 exits immediately with 0 tasks if finder has not run first.
-
-### Pipeline & middleware import paths — full path vs short path
-
-> **⚠️ IMPORTANT: Always use full module paths in spider `custom_settings`.**
-
-`dashmote_sourcing` exposes pipelines and middlewares in two ways:
-
-| Style | Example | Works when |
-|-------|---------|------------|
-| **Short path** | `dashmote_sourcing.pipelines.RDSPipeline` | Only if `pipelines/__init__.py` re-exports the class (depends on package version) |
-| **Full path** | `dashmote_sourcing.pipelines.mysql_pipeline.RDSPipeline` | Always — directly references the module file |
-
-The SpiderKeeper production environment (EC2 Docker container) may run a different
-`dashmote_sourcing` version than your local dev environment. Older versions do NOT
-re-export classes in `__init__.py`, so short paths cause `NameError` at runtime —
-even though the same short path works perfectly on your local machine.
-
-**Always use the full module path** to ensure compatibility across all environments.
-This is consistent with existing production projects (DLR, IFD, etc.):
-
-| Component | Full path (use this) |
-|-----------|---------------------|
-| RDSPipeline | `dashmote_sourcing.pipelines.mysql_pipeline.RDSPipeline` |
-| PreprocessPipeline | `dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline` |
-| S3Pipeline | `dashmote_sourcing.pipelines.s3_pipeline.S3Pipeline` |
-| MongoDBPipeline | `dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline` |
-| PrometheusMiddleware | `dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware` |
 
 ### Local testing pipeline options
 
@@ -1214,14 +1283,14 @@ inside `custom_settings['ITEM_PIPELINES']`. To switch between testing and produc
 
 > ⚠️ **Finder and detail have different rules — read carefully.**
 
-**Finder** — keep `RDSPipeline` active and additionally uncomment `MongoDBPipeline`.
-`RDSPipeline` writes outlet IDs to MySQL, which `detail.filter()` reads at startup.
-If you comment out `RDSPipeline`, detail will find no outlets and exit immediately.
+**Finder** — keep `RedisPipeline` active and additionally uncomment `MongoDBPipeline`.
+`RedisPipeline` writes outlet IDs to MySQL, which `detail.filter()` reads at startup.
+If you comment out `RedisPipeline`, detail will find no outlets and exit immediately.
 
 ```python
 "ITEM_PIPELINES": {
     'dashmote_sourcing.pipelines.mysql_pipeline.RDSPipeline': 300,            # must stay on
-    'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 300,      # for testing
+    'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 300,          # for testing
 },
 ```
 
@@ -1230,9 +1299,9 @@ If you comment out `RDSPipeline`, detail will find no outlets and exit immediate
 
 ```python
 "ITEM_PIPELINES": {
-    'dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline': 100,  # must stay on
+    'dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline': 100,       # must stay on
     # 'dashmote_sourcing.pipelines.s3_pipeline.S3Pipeline': 400,
-    'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 400,        # for testing
+    'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 400,          # for testing
 },
 ```
 
@@ -1241,7 +1310,7 @@ Results are stored in the `{platform_name}` database, one collection per table.
 
 **Disable MongoDBPipeline (before deployment):**
 Restore the original state — comment out `MongoDBPipeline`, uncomment `S3Pipeline`
-in detail. `RDSPipeline` in finder was never commented out, so no change needed there.
+in detail. `RedisPipeline` in finder was never commented out, so no change needed there.
 Always verify with Phase 12.5 before committing or pushing.
 
 ### Step 0 — MongoDB availability
@@ -1269,72 +1338,27 @@ Skip all MongoDBPipeline configuration steps below.
 
 ### Step 0.5 — Check QA config for PreprocessPipeline
 
-`PreprocessPipeline` (required by detail spider) initialises by fetching a
-validation spreadsheet from Google Drive. It searches for a file named
-`{ID_PLATFORM}_{prefix}*` inside the `{prefix}` subfolder of the QA folder.
-If the spreadsheet does not exist for this platform yet, initialisation raises
-`FileNotFoundError` and the detail spider fails to start.
-
-Run this check before any local test:
+Detail's `PreprocessPipeline` needs a Google Drive validation sheet named
+`{ID_PLATFORM}_{prefix}*` in the QA folder. Missing sheet → `FileNotFoundError`
+on spider start. Check first:
 
 ```bash
 poetry run python - <<'PYEOF'
 from dashmote_sourcing.db import GoogleClient
-
-config = {
-    'id_platform': '{id_platform}',
-    'country':     '{first_prefix}',
-    'table_list':  ['outlet_information', 'outlet_meal', 'meal_option', 'option_relation'],
-}
 try:
-    GoogleClient.from_config(config)
-    print("✅  QA config found — PreprocessPipeline will initialise normally.")
+    GoogleClient.from_config({'id_platform':'{id_platform}','country':'{first_prefix}',
+        'table_list':['outlet_information','outlet_meal','meal_option','option_relation']})
+    print("OK")
 except FileNotFoundError as e:
-    print(f"❌  QA config NOT found: {e}")
+    print(f"MISSING: {e}")
 PYEOF
 ```
 
-**If QA config is found** → proceed to Step 1 with `PreprocessPipeline` enabled as-is.
+**OK** → proceed with `PreprocessPipeline` enabled.
 
-**If QA config is NOT found** (new platform, no QA sheet yet):
-
-Disable `PreprocessPipeline` in detail's `custom_settings` for local testing:
-
-```python
-"ITEM_PIPELINES": {
-    # 'dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline': 100,  # disabled — QA config missing
-    # 'dashmote_sourcing.pipelines.s3_pipeline.S3Pipeline': 400,
-    'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 400,       # for testing
-},
-```
-
-Then notify the user:
-
-> ⚠️ **Action required — QA config missing**
-> `PreprocessPipeline` has been disabled for local testing because no QA validation
-> spreadsheet was found for `{id_platform}_{first_prefix}` in Google Drive.
->
-> After confirming that the spider's field mappings are correct, please contact the
-> **Quality & Assurance team** and ask them to create the validation spreadsheet for
-> this platform (`{id_platform}`) in the QA folder under each prefix subfolder.
->
-> Once the QA config is added, re-enable `PreprocessPipeline` in `custom_settings`
-> before deploying to production.
-
-After local testing completes (Step 2), if `PreprocessPipeline` was disabled,
-re-run the check above. If QA config is now present, re-enable it:
-
-```python
-"ITEM_PIPELINES": {
-    'dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline': 100,
-    # 'dashmote_sourcing.pipelines.s3_pipeline.S3Pipeline': 400,
-    # 'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 400,
-},
-```
-
-If QA config is still absent at deployment time, block the deployment and remind
-the user — production runs without `PreprocessPipeline` will skip type casting
-and validation, risking malformed data in S3.
+**MISSING** → comment out `PreprocessPipeline` in detail's `custom_settings`
+for local testing only, tell the user to request the QA team create the sheet,
+and re-enable before Phase 13 (pre-deploy check in Phase 12.5 enforces this).
 
 ### Step 1 — Finder spider (if exists)
 
@@ -1342,8 +1366,20 @@ and validation, risking malformed data in S3.
 With MongoDBPipeline active it writes the feed item to MongoDB instead of MySQL.
 ```bash
 scrapy crawl conso_outlet_finder -a prefix={first_prefix} -a local_test=True \
-    -s CLOSESPIDER_ITEMCOUNT=1
+    -s CLOSESPIDER_ITEMCOUNT=30 -s LOG_LEVEL=INFO 2>&1 | tee /tmp/finder_smoke.log
 ```
+
+**Hard Rule R1 self-check — MUST hold, otherwise the spider is broken:**
+
+```bash
+grep -E "Crawled [1-9][0-9]* pages" /tmp/finder_smoke.log
+```
+
+If this returns **no match** (i.e. `Crawled 0 pages` for the whole run) while
+`scraped N items` is non-zero, your spider is bypassing the Scrapy Downloader
+— Hard Rule R1 violation. Go back to Phase 8.1, port all synchronous HTTP calls
+(`requests`/`httpx`/`curl_cffi`/`tls_client`) to `yield scrapy.Request(...)`.
+The smoke will pass locally but production will silently drop all data.
 
 ### Step 2 — Detail spider
 
@@ -1363,7 +1399,7 @@ confirm the data looks correct before proceeding to Step 4.
 **If `USE_MONGODB = True`**: run the data inspection script:
 
 ```bash
-poetry run python ${CLAUDE_SKILL_DIR}/check_mongodb.py
+poetry run python ~/.claude/commands/conso-migrate/check_mongodb.py
 ```
 
 The script auto-detects the settings module from `scrapy.cfg`, then reads
@@ -1373,7 +1409,7 @@ sample record per collection, and flags any unique-key fields that are `None`.
 
 If auto-detection fails, pass the settings module explicitly:
 ```bash
-poetry run python ${CLAUDE_SKILL_DIR}/check_mongodb.py --settings {id_platform}.settings
+poetry run python ~/.claude/commands/conso-migrate/check_mongodb.py --settings {id_platform}.settings
 ```
 
 Ask the user to review the output and confirm:
@@ -1392,17 +1428,17 @@ be explicitly activated once local validation passes.
 
 ```bash
 # Both spiders ready:
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} --prefixes {prefixes_comma_separated} \
     --activate --verify
 
 # Finder only (detail not yet ready):
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} --prefixes {prefixes_comma_separated} \
     --activate --finder-only --verify
 
 # Detail only (no finder, or finder already activated):
-poetry run python ${CLAUDE_SKILL_DIR}/cass_insert.py \
+poetry run python ~/.claude/commands/conso-migrate/cass_insert.py \
     --id-platform {id_platform} --prefixes {prefixes_comma_separated} \
     --activate --detail-only --verify
 ```
@@ -1431,29 +1467,23 @@ Diagnose and fix any errors before proceeding. Common issues:
 
 ---
 
-## Phase 12.5 — Pre-deployment Pipeline Check
+## Phase 12.5 — **Pre-launch Gate** (all 5 must pass, STOP-style)
 
-Before committing or building the egg, verify that both spiders are in production state:
+Unified forcing function. Claude **cannot** build the `.egg` or launch any
+Fargate task until ALL 5 checks return green. These correspond to the
+Cross-phase Invariants at the top of this skill.
 
-```bash
-grep -n "MongoDBPipeline" {id_platform}/spiders/conso_outlet_finder.py \
-                          {id_platform}/spiders/conso_outlet_detail.py
-```
+| # | Invariant | Check command | On fail |
+|---|---|---|---|
+| **G1** | I1: `DB = PLATFORM` in settings | `grep -nE "^DB\s*=" {id_platform}/settings.py` | Add the line. Missing = silent MySQL write failure (YDE/LMN 2026-04-13) |
+| **G2** | I2: finder `FeedItem.tablename = "outlet_feeds"` (and other items match Phase 8.0 table) | `grep -n 'tablename\s*=' {id_platform}/items.py` — compare to Phase 8.0 contract table | Fix to match; only run Phase 11.5 DiagnosticSpider if you suspect scrapyd was upgraded |
+| **G3** | I5: no uncommitted changes AND ECR image newer than last commit | `git status -s` empty AND `aws ecr describe-images ...` vs `git log -1 --format=%cI` | `git add/commit/push`, wait for platform.yml build |
+| **G4** | I4: QA validation sheet exists, OR PreprocessPipeline commented | `poetry run python -c "from dashmote_sourcing.db import GoogleClient; GoogleClient.from_config({'id_platform':'{id_platform}','country':'{first_prefix}','table_list':['outlet_information','outlet_meal','meal_option','option_relation']})"` | If the probe raises `FileNotFoundError`: either contact Q&A to create `{ID_PLATFORM}_{prefix}` sheet, OR comment out `PreprocessPipeline` in detail (leaves a TODO before production) |
+| **G5** | Production pipeline state: MongoDBPipeline disabled, MYSQL_ITEM_SIZE not set small | `grep -n "MongoDBPipeline\|MYSQL_ITEM_SIZE" {id_platform}/spiders/*.py {id_platform}/settings.py` | Every `MongoDBPipeline` line must start with `# `; `MYSQL_ITEM_SIZE` must not be in settings.py (if present, must be ≥ 1000) |
 
-Every line matching `MongoDBPipeline` must be **commented out** (`# `).
-Any uncommented `MongoDBPipeline` line means local testing mode is still active —
-re-comment it and uncomment the corresponding production pipeline before proceeding.
-
-Also verify `PreprocessPipeline` is **enabled** in detail's `custom_settings`:
-
-```bash
-grep -n "PreprocessPipeline" {id_platform}/spiders/conso_outlet_detail.py
-```
-
-The line must be uncommented. If it is commented out (QA config was missing during
-local testing), re-run the QA config check from Step 0.5 first. If the config is
-now present, re-enable `PreprocessPipeline`. If it is still absent, **do not deploy**
-— contact the Q&A team and wait for the validation spreadsheet before proceeding.
+**Do not negotiate these gates.** Skipping any one of them has cost the team days
+of silent data loss in past incidents. See Appendix A for the specific incidents
+that each gate prevents.
 
 ---
 
@@ -1515,12 +1545,83 @@ Confirm `conso_outlet_finder` appears in the response, then delete the temp cook
 rm -f /tmp/sk_cookie.txt
 ```
 
+### 13.5 — **Post-deploy MySQL verification (15-min rule)**
+
+> **Why:** `scraped N items` counter increments every time `process_item`
+> returns (even when the if-filter dropped the item on its way in). MySQL
+> row count is the only source of truth. YDE/LMN 2026-04-13 ran for 13 days
+> with rising scraped_count and zero writes — the team trusted the counter,
+> nobody checked MySQL. Every new deploy you own from now on, you verify
+> MySQL within 15 minutes. See Appendix A1.
+
+Scrapy's `scraped N items` counter is a **liar**: it increments even when every
+item is silently dropped by the pipeline. Only MySQL itself is authoritative.
+
+Within 15 minutes of starting the finder, verify:
+
+```bash
+poetry run python - <<'PYEOF'
+from dashmote_sourcing.db import MySQLClient
+with MySQLClient.get_connection_context(db_name='{id_platform}') as c:
+    cur = c.cursor()
+    cur.execute("SELECT COUNT(*), MAX(last_refresh) FROM {first_prefix}")
+    print(cur.fetchone())
+PYEOF
+```
+
+Row count must be growing AND `MAX(last_refresh)` must be within the last few
+minutes. If not, **stop the job and run the diagnostic checklist below** —
+never "let it run, maybe it'll start writing". It won't.
+
+### 13.6 — **Silent-failure diagnostic checklist (run in order)**
+
+Four root causes, each responsible for past "0 write" incidents:
+
+| # | Symptom | Check | Fix |
+|---|---|---|---|
+| 1 | `db_name=None` at runtime → connects to empty DB | `grep -n "^DB\s*=" {id_platform}/settings.py` | Add `DB = PLATFORM` in settings.py. scrapyd's RDSPipeline has NO fallback — omit this line and every write silently fails. (YDE/LMN 2026-04-13, 13+ days of data loss) |
+| 2 | `Crawled 0 pages` but `scraped N items` rising | Grep SpiderKeeper log for `Crawled [0-9]+ pages` | Spider is bypassing Scrapy Downloader (Hard Rule R1/R2 violation). Port all sync HTTP to `yield scrapy.Request + callback`. (YDE original, 60h loss) |
+| 3 | `Ignoring response <403>` repeating | Grep SpiderKeeper log | TLS fingerprint or User-Agent wrong. Set `self.IMPERSONATE = 'chrome110'`, add `meta['impersonate']=self.IMPERSONATE` on every Request, and put a matching browser UA in headers. |
+| 4 | `tablename` filter mismatch | Run diagnostic spider (see below) to see the running `RDSPipeline` source | Check `self.item_tablename` line; set `FeedItem.tablename` to match. Working peers: IFD/TKW/JSE/DLR. |
+
+**Diagnostic spider** — drop this into `{id_platform}/spiders/diagnostic.py`,
+rebuild egg, schedule on SpiderKeeper, read the log (dumps installed packages +
+RDSPipeline source):
+
+```python
+import sys, platform, inspect
+from importlib.metadata import distributions
+from scrapy import Spider
+
+class DiagnosticSpider(Spider):
+    name = "diagnostic"
+    custom_settings = {"ITEM_PIPELINES": {}, "CLOSESPIDER_TIMEOUT": 5}
+
+    def start_requests(self):
+        self.logger.info(f"PROBE> python={sys.version}  platform={platform.platform()}")
+        for d in sorted(distributions(), key=lambda d: d.metadata['name']):
+            self.logger.info(f"PROBE> PKG {d.metadata['name']}=={d.version}")
+        from dashmote_sourcing.pipelines.mysql_pipeline import RDSPipeline
+        for i, line in enumerate(inspect.getsource(RDSPipeline).split('\n'), 1):
+            self.logger.info(f"PROBE> RDS L{i:3}: {line}")
+        return []
+```
+
+### 13.7 — **Last-resort only: project-local DirectMySQLPipeline**
+
+If items 1-4 above are ALL cleared and MySQL still flat, the scrapyd container's
+`RDSPipeline` has an undiagnosable bug. Only then, write a project-local
+`{id_platform}/pipelines.py` that uses `MySQLClient.get_connection_context` +
+`executemany` directly, and point `ITEM_PIPELINES` at it. After deploying the
+stop-gap, file a follow-up to find the real bug and revert to standard RDSPipeline
+— long-term custom pipelines accumulate drift risk no one will maintain.
+
 ---
 
 ## Phase 14 — Generate README.md
 
 Write `README.md` in the project root. Use
-`${CLAUDE_SKILL_DIR}/README.md.template` as a **style and structure
+`~/.claude/commands/conso-migrate/README.md.template` as a **style and structure
 reference** — match its depth, tone, and section layout. Do NOT copy it or
 mechanically substitute fields; write original prose and content derived entirely
 from the actual project code.
@@ -1668,3 +1769,85 @@ This migration is performed automatically by {current_model}. The AI-generated c
 ---
 
 🎉 **{platform_name} ({id_platform}) has been successfully migrated to ConSo!**
+
+---
+
+## Appendix A — Known Incidents (reference)
+
+Each entry: symptom → root cause → prevention. Cross-linked from Gate checks and
+Failure Pattern Index. When Claude sees a similar symptom during migration or
+post-deploy monitoring, find the match here first.
+
+### A1. YDE / LMN 2026-04-13 — `DB` setting missing, 13+ days silent MySQL loss
+
+- **Symptom**: SpiderKeeper log shows `Crawled N pages, scraped M items` growing, `RDSPipeline > Inserted/Updated` log NEVER appears, MySQL `{id_platform}.{prefix}` table row count flat.
+- **Root cause**: scrapyd container's `RDSPipeline.__init__` does `self.db_name = self.settings.get("DB")` with no fallback. Without `DB = PLATFORM` in `settings.py`, `db_name=None`, connection opens to empty DB, INSERTs silently fail (no exception).
+- **Prevention**: Phase 12.5 Gate **G1**.
+- **How we found it**: DiagnosticSpider revealed RDSPipeline source L24.
+
+### A2. YDE 2026-04-10 original — `start_requests` yields Item directly, 60h 0 writes
+
+- **Symptom**: `Crawled 0 pages` permanently, `scraped N items` grows. No errors.
+- **Root cause**: spider used `curl_cffi.Session.post()` synchronously inside `start_requests()` and `yield FeedItem()` directly. Items went through `scraper.start_itemproc(item, response=None)` path, which the scrapyd container's old `dashmote_sourcing` handled incorrectly → items filtered out.
+- **Prevention**: Phase 8.1 Hard Rules R1 + R2; Phase 12 Step 1 check `grep "Crawled [1-9]+ pages"`.
+
+### A3. YDE 2026-04-13 detail — `PreprocessPipeline` QA sheet missing, start failure
+
+- **Symptom**: detail spider exits immediately on Fargate with `FileNotFoundError: Validation file not found for {ID_PLATFORM}_{prefix}`.
+- **Root cause**: `PreprocessPipeline.__init__` fetches Google Drive validation sheet; missing for new platforms.
+- **Prevention**: Phase 12.5 Gate **G4**. Temporary workaround: comment `PreprocessPipeline` in detail's `ITEM_PIPELINES`; production fix: contact Q&A team to create the sheet.
+
+### A4. YDE 2026-04-13 — `scrapy-impersonate` not in scrapyd container
+
+- **Symptom**: SpiderKeeper log: `ModuleNotFoundError: No module named 'scrapy_impersonate'`.
+- **Root cause**: `.egg` uploads carry project code only, not pip dependencies. The scrapyd container's frozen environment has `curl_cffi` + `tls_client` but NOT `scrapy-impersonate`.
+- **Prevention**: Phase 11.5 DiagnosticSpider dumps installed packages before any real deploy. For TLS impersonation in scrapyd, use a project-local `DownloaderMiddleware` wrapping `curl_cffi` (pattern used by YDE; similar to TKW's `TlsClientDownloaderMiddleware`).
+
+### A5. Pipeline / middleware **full path vs short path** trap
+
+- **Symptom**: local spider runs fine, SpiderKeeper deploy throws `NameError` / `ImportError` on a class that clearly exists in the package, OR silent misbehaviour because a stubbed class is resolved instead.
+- **Root cause**: `dashmote_sourcing.pipelines.__init__.py` (and `middlewares.__init__.py`) re-export class shortcuts in newer versions only. Local venv has a newer `dashmote_sourcing`; scrapyd container has an older one without re-exports. `custom_settings` using short path `dashmote_sourcing.pipelines.RDSPipeline` resolves locally but not in scrapyd.
+- **Prevention**: **always use full module paths** in `custom_settings['ITEM_PIPELINES']` and `DOWNLOADER_MIDDLEWARES`. Never `dashmote_sourcing.pipelines.XyzPipeline` — always `dashmote_sourcing.pipelines.xyz_pipeline.XyzPipeline`. Canonical paths:
+  | Component | Full path |
+  |---|---|
+  | RDSPipeline | `dashmote_sourcing.pipelines.mysql_pipeline.RDSPipeline` |
+  | PreprocessPipeline | `dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline` |
+  | S3Pipeline | `dashmote_sourcing.pipelines.s3_pipeline.S3Pipeline` |
+  | MongoDBPipeline | `dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline` |
+  | PrometheusMiddleware | `dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware` |
+  | StaticProxyMiddleware | `dashmote_sourcing.middlewares.proxy_middleware.StaticProxyMiddleware` |
+  | DynamicProxiesMiddleware | `dashmote_sourcing.middlewares.proxy_middleware.DynamicProxiesMiddleware` |
+
+---
+
+## Appendix B — Failure Pattern Index (symptom → lookup)
+
+Scan this table when anything looks wrong. Faster than re-deriving the diagnosis.
+
+| Observed symptom | Likely root cause | Look at |
+|---|---|---|
+| `Crawled 0 pages` while `scraped N items` rising | Hard Rule R1 violated — sync HTTP inside spider method bypassing Scrapy Downloader | Phase 8.1 R1 + A2 |
+| `scraped N items` but MySQL row count flat, no errors | `DB = PLATFORM` missing OR `FeedItem.tablename` doesn't match scrapyd filter | Phase 12.5 G1/G2 + A1 |
+| Finder log has NO `Inserted/Updated` after 15 min | Same as above | Same |
+| `Ignoring response <403>` repeating | TLS fingerprint or User-Agent blocked | Phase 8.1 IMPERSONATE |
+| Detail spider exits with `FileNotFoundError: Validation file` | `PreprocessPipeline` QA sheet missing | Phase 12.5 G4 + A3 |
+| `ModuleNotFoundError: No module named 'scrapy_impersonate'` | Dependency missing from scrapyd container | A4, use project-local curl_cffi middleware |
+| `exitCode=137` on Fargate | Container OOM | `/run-detail` Phase 5.3b auto-recover |
+| `'bool' object has no attribute 'get'` on `filter()` | Stale ECR image (framework API changed) | Phase 12.5 G3, rebuild image |
+| Uncompressed body / double-decompression errors | TLS middleware not stripping `Content-Encoding` | YDE `CurlCffiImpersonateMiddleware` pattern |
+| Finder MySQL writes fine, detail S3 path empty at `sourcing/YDE/` | You ran with `sample>0` → check `sourcing/sample/YDE/` instead | Phase 12 Step 2 |
+| `NameError` / `ImportError` on a pipeline class in SpiderKeeper but local works | Short-path import; scrapyd's older `dashmote_sourcing` doesn't re-export | A5, switch to full module path |
+
+---
+
+## Appendix C — Cognitive Checklist (before every major action)
+
+Claude: before executing the next phase, answer these:
+
+1. **Which peer platform am I mirroring for this decision?** (Phase 0.05 matrix)
+2. **Does my current spider code satisfy all 5 Cross-phase Invariants at the top of this skill?**
+3. **Have I run DiagnosticSpider once to confirm scrapyd's actual state?** (Phase 11.5)
+4. **Which Gate (G1-G5) might this next action violate?** (Phase 12.5)
+5. **If something goes silently wrong, which Appendix B symptom row will I map to?**
+
+If any answer is "I don't know" → stop and collect the data before proceeding.

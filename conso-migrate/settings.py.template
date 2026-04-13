@@ -3,6 +3,12 @@
 PLATFORM = '{{ID_PLATFORM}}'
 PLATFORM_NAME = '{{PLATFORM_NAME}}'
 
+# REQUIRED — scrapyd container's RDSPipeline reads self.settings.get("DB")
+# with NO fallback. Omitting this line makes db_name=None → MySQL writes
+# silently fail with ZERO error logs while scraped_count keeps rising.
+# YDE/LMN 2026-04-13: 13+ days of silent data loss due to missing this line.
+DB = PLATFORM
+
 BOT_NAME = PLATFORM
 
 SPIDER_MODULES = [f"{BOT_NAME}.spiders"]
@@ -56,3 +62,11 @@ MONGODB_UNIQUE_KEYS = {
 REQUEST_FINGERPRINTER_IMPLEMENTATION = '2.7'
 TWISTED_REACTOR = 'twisted.internet.asyncioreactor.AsyncioSelectorReactor'
 FEED_EXPORT_ENCODING = 'utf-8'
+
+# Route scrapy.Request through scrapy-impersonate (curl_cffi under the hood) when
+# the spider sets meta['impersonate'] = '<browser_profile>' (e.g. 'chrome110').
+# Without meta['impersonate'], Scrapy uses its default HTTPS handler as usual.
+DOWNLOAD_HANDLERS = {
+    'http':  'scrapy_impersonate.ImpersonateDownloadHandler',
+    'https': 'scrapy_impersonate.ImpersonateDownloadHandler',
+}

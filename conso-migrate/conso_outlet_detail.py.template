@@ -1,3 +1,27 @@
+# ConSo Detail contract — READ BEFORE EDITING
+# ─────────────────────────────────────────────
+# Same hard rules as conso_outlet_finder.py:
+#   - All HTTP via `yield scrapy.Request(...)`.
+#   - Items yielded from callbacks only, NEVER from start_requests().
+#   - No direct requests / httpx / curl_cffi / tls_client calls inside spider methods.
+#   - No time.sleep(); use DOWNLOAD_DELAY in custom_settings.
+#
+# Multi-step request chains (e.g. catalog → menu → options) are expressed as
+# a chain of callbacks passing state through request.meta:
+#
+#   def parse_catalog(self, response):
+#       yield OutletItem(...)
+#       yield scrapy.Request(menu_url, callback=self.parse_menu,
+#                            meta={'id_outlet': response.meta['id_outlet']})
+#
+#   def parse_menu(self, response):
+#       for meal in ...:
+#           yield MealItem(...)
+#
+# TLS fingerprint impersonation: set self.IMPERSONATE (e.g. 'chrome110') and
+# include meta['impersonate'] = self.IMPERSONATE in every yielded Request. The
+# settings.py DOWNLOAD_HANDLERS routes those through scrapy-impersonate (curl_cffi).
+
 import scrapy
 import logging
 
@@ -9,6 +33,9 @@ class ConSoOutletDetail(BaseSpider):
     name = "conso_outlet_detail"
     id_platform = "{{ID_PLATFORM}}"
 
+    # Optional TLS fingerprint profile (curl_cffi). Leave None if not needed.
+    IMPERSONATE = None   # e.g. 'chrome110'
+
     custom_settings = {
         "ITEM_PIPELINES": {
             'dashmote_sourcing.pipelines.preprocess_pipeline.PreprocessPipeline': 100,
@@ -19,6 +46,8 @@ class ConSoOutletDetail(BaseSpider):
             'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 543,
         },
         "LOG_LEVEL": "INFO",
+        "CONCURRENT_REQUESTS": 16,
+        "DOWNLOAD_DELAY": 0.2,
     }
 
     def __init__(
@@ -105,10 +134,15 @@ class ConSoOutletDetail(BaseSpider):
             if outlet_data := self.get_metadata(id_outlet):
                 # [PORT YOUR REQUEST LOGIC HERE]
                 # Replace the URL, headers, body and method to match the platform API.
+                # For multi-request flows (catalog→menu→options), yield the first
+                # Request here and chain the rest inside parse callbacks using meta.
+                meta = {"id_outlet": id_outlet, "outlet_data": outlet_data}
+                if self.IMPERSONATE:
+                    meta['impersonate'] = self.IMPERSONATE
                 yield scrapy.Request(
                     url=...,
                     callback=self.parse,
-                    meta={"id_outlet": id_outlet, "outlet_data": outlet_data},
+                    meta=meta,
                 )
 
     # ------------------------------------------------------------------ #

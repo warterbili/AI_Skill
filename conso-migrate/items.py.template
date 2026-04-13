@@ -1,0 +1,107 @@
+import scrapy
+
+
+class OutletItem(scrapy.Item):
+    tablename = "outlet_information"
+
+    id_outlet = scrapy.Field()
+    id_platform = scrapy.Field()
+    name = scrapy.Field()
+    address = scrapy.Field()
+    street = scrapy.Field()
+    house_number = scrapy.Field()
+    postal_code = scrapy.Field()
+    city = scrapy.Field()
+    region = scrapy.Field()
+    country = scrapy.Field()
+    source_country = scrapy.Field()
+    lat = scrapy.Field()
+    lon = scrapy.Field()
+    telephone = scrapy.Field()
+    url = scrapy.Field()
+    website = scrapy.Field()
+    platform = scrapy.Field()
+    source = scrapy.Field()
+    rating = scrapy.Field()
+    review_nr = scrapy.Field()
+    price_level = scrapy.Field()
+    cuisine = scrapy.Field()
+    category = scrapy.Field()
+    is_new = scrapy.Field()
+    pickup_available = scrapy.Field()
+    delivery_available = scrapy.Field()
+    id_chain = scrapy.Field()
+    chain_name = scrapy.Field()
+    banner_img_url = scrapy.Field()
+    description = scrapy.Field()
+    opening_hours = scrapy.Field()
+    closed = scrapy.Field()
+    currency = scrapy.Field()
+
+
+class MealItem(scrapy.Item):
+    tablename = "outlet_meal"
+
+    id_outlet = scrapy.Field()
+    id_meal = scrapy.Field()
+    id_category = scrapy.Field()
+    id_menu = scrapy.Field()
+    id_platform = scrapy.Field()
+    name = scrapy.Field()
+    description = scrapy.Field()
+    category = scrapy.Field()
+    category_description = scrapy.Field()
+    menu = scrapy.Field()
+    price = scrapy.Field()
+    image_url = scrapy.Field()
+    position = scrapy.Field()
+    sold_out = scrapy.Field()
+    popular = scrapy.Field()
+    is_alcohol = scrapy.Field()
+    feature = scrapy.Field()
+    choices = scrapy.Field()
+    platform = scrapy.Field()
+    source = scrapy.Field()
+    meal_id = scrapy.Field()
+    menu_id = scrapy.Field()
+    popup_id = scrapy.Field()
+
+
+class OptionItem(scrapy.Item):
+    tablename = "meal_option"
+
+    id_outlet = scrapy.Field()
+    id_option = scrapy.Field()
+    id_platform = scrapy.Field()
+    name = scrapy.Field()
+    description = scrapy.Field()
+    category = scrapy.Field()
+    price = scrapy.Field()
+    platform = scrapy.Field()
+
+
+class RelationItem(scrapy.Item):
+    tablename = "option_relation"
+
+    id_outlet = scrapy.Field()
+    id_meal = scrapy.Field()
+    id_option = scrapy.Field()
+    id_option_parent = scrapy.Field()
+    id_platform = scrapy.Field()
+    option_level = scrapy.Field()
+    platform = scrapy.Field()
+
+
+class FeedItem(scrapy.Item):
+    tablename = "outlet_feeds"
+
+    id_outlet = scrapy.Field()
+
+
+__all__ = [
+    'OutletItem',
+    'MealItem',
+    'OptionItem',
+    'RelationItem',
+    'FeedItem',
+]

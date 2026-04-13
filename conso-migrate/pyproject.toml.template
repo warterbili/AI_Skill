@@ -9,6 +9,10 @@ repository = "https://github.com/{{GITHUB_ORG}}/{{ID_PLATFORM}}.git"
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 dashmote-sourcing = {git = "ssh://git@github.com/{{GITHUB_ORG}}/dashmote_sourcing.git", branch = "feature/conso"}
+# TLS fingerprint impersonation routed through Scrapy's Downloader (curl_cffi under the hood).
+# Activated when a Request has meta['impersonate'] = '<browser_profile>'. Leave installed
+# even if the platform doesn't need it today — enabling it later is one line of meta.
+scrapy-impersonate = "^1.6.3"
 
 [build-system]
 requires = ["poetry-core"]
