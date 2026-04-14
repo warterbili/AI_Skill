@@ -197,20 +197,29 @@ def main():
     print(f"    Key pattern: {platform}:{{prefix}}:{args.key_suffix}\n")
 
     total_grids = 0
-    print(f"  {'Prefix':<8} {'Key':<35} {'Grids Remaining':>16}")
-    print(f"  {'─'*6:<8} {'─'*33:<35} {'─'*16:>16}")
+    print(f"  {'Prefix':<8} {'Key':<35} {'Grids In Set':>13} {'Status':<20}")
+    print(f"  {'─'*6:<8} {'─'*33:<35} {'─'*13:>13} {'─'*18:<20}")
 
     for r in results:
         count = r['grids_remaining']
         total_grids += count
-        icon = '✅' if count > 0 else '⚠️'
-        print(f"  {icon} {r['prefix']:<6} {r['key']:<35} {count:>15,}")
+        # ZCARD=0 is normal for finder round-cycling (pop_and_push_grid):
+        # grids are temporarily out of the sorted set while being processed.
+        # Only key-not-exist (count=0 AND key doesn't exist) is a real problem,
+        # but ZCARD can't distinguish "empty set" from "key missing" — both return 0.
+        # So ZCARD=0 is informational, not a warning. The real signal is
+        # MySQL last_refresh (check_mysql.py / check_spiderkeeper.py).
+        if count > 0:
+            icon = '✅'
+            status = f'{count:,} in queue'
+        else:
+            icon = 'ℹ️'
+            status = '0 (round cycling or empty)'
+        print(f"  {icon} {r['prefix']:<6} {r['key']:<35} {count:>12,}  {status}")
 
-    print(f"\n  Total remaining grids: {total_grids:,}")
-
-    has_grids = sum(1 for r in results if r['grids_remaining'] > 0)
-    empty = sum(1 for r in results if r['grids_remaining'] == 0)
-    print(f"  ✅ {has_grids} with grids  ⚠️ {empty} exhausted (round cycling)")
+    print(f"\n  Total grids in sets: {total_grids:,}")
+    print(f"  Note: ZCARD=0 is normal for finder — grids are popped and pushed back")
+    print(f"  in a round-robin loop. Use check_mysql.py to verify actual write activity.")
 
 
 if __name__ == '__main__':
