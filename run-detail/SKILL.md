@@ -203,29 +203,17 @@ IMAGE_NAME="conso_${ID_PLATFORM_LOWER}_spider"
 ### 0.4 Resolve remaining AWS variables (dynamic — nothing hardcoded)
 
 ```bash
-# ---- Constants (safe to hardcode — project-level, not account-level) ----
-export CLUSTER="conso-cluster"
-export TASK_FAMILY="conso-outlet-detail"
-export SERVICE_NAME="conso-outlet-detail"      # Invariant I2: must match task family
+# ---- Real infrastructure (matches Lambda dash-sourcing-spider-scheduler) ----
+# Ground truth: download Lambda code to verify if in doubt.
+# Incident A7/A8: conso-cluster + conso-outlet-detail + ggm_app is LEGACY — do NOT use.
+export CLUSTER="arn:aws:ecs:eu-central-1:593453040104:cluster/sourcing"
+export TASK_FAMILY="conso_${ID_PLATFORM_LOWER}_spider"   # platform-specific, NOT shared
+export CONTAINER_NAME="conso_${ID_PLATFORM_LOWER}_spider" # matches task def container
+export SERVICE_NAME="conso-outlet-detail"                  # Invariant I2: Loki label only
 
-# ---- Dynamic from AWS (change per account/VPC) ----
-# Network config: read from the cluster's default CapacityProvider or tag lookup
-# Subnet: look for a tag Name containing 'conso' or 'public' in the VPC the cluster lives in.
-SUBNET_IDS=$(aws ec2 describe-subnets --region "$AWS_REGION" \
-    --filters "Name=tag:Name,Values=*conso*,*sourcing*,*public*" \
-    --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
-
-# Security group: look for one tagged for this cluster, or default to the cluster's
-# own SG. If lookup fails, ask the user rather than guessing.
-SG_IDS=$(aws ec2 describe-security-groups --region "$AWS_REGION" \
-    --filters "Name=tag:Name,Values=*conso*,*fargate*" \
-    --query 'SecurityGroups[].GroupId' --output text | tr '\t' ',')
-
-if [[ -z "$SUBNET_IDS" || -z "$SG_IDS" ]]; then
-    echo "⚠️  Could not auto-discover subnets/security groups via tags."
-    echo "    Ask the user: 'What subnet IDs and SG IDs should the task use?'"
-    echo "    Tip: 'aws ec2 describe-subnets' and 'aws ec2 describe-security-groups' listings help."
-fi
+# ---- Network (Lambda hardcodes these — stable, sourcing VPC) ----
+SUBNET_IDS="subnet-0316d462f5e3f726f"
+SG_IDS="sg-0bac0f4e132099788"
 
 # ---- Loki SSM instance: discover by tag, NOT hardcoded ID ----
 LOKI_INSTANCE_ID=$(aws ec2 describe-instances --region "$AWS_REGION" \
@@ -249,11 +237,12 @@ fi
 | `BRANCH` | `feature/conso` | Phase 3 workflow dispatch |
 | `AWS_ACCOUNT_ID` | (dynamic, e.g. `593453040104`) | Phase 4 image URI |
 | `AWS_REGION` | `eu-central-1` | every `aws` call |
-| `CLUSTER` | `conso-cluster` | Phase 1/5 task queries |
-| `TASK_FAMILY` | `conso-outlet-detail` | Phase 4 task-def family |
-| `SERVICE_NAME` | `conso-outlet-detail` | Phase 5 overrides, Phase 6 Loki label (I2) |
-| `SUBNET_IDS` | (dynamic) | Phase 5 run-task network config |
-| `SG_IDS` | (dynamic) | Phase 5 run-task network config |
+| `CLUSTER` | `sourcing` (ARN) | Phase 1/5 task queries — NOT conso-cluster (A7/A8) |
+| `TASK_FAMILY` | `conso_dlr_spider` | Phase 4 task-def family — platform-specific, NOT shared |
+| `CONTAINER_NAME` | `conso_dlr_spider` | Phase 5 overrides — NOT ggm_app (A8) |
+| `SERVICE_NAME` | `conso-outlet-detail` | Phase 6 Loki label only (I2) |
+| `SUBNET_IDS` | `subnet-0316d462f5e3f726f` | Phase 5 — from Lambda ground truth |
+| `SG_IDS` | `sg-0bac0f4e132099788` | Phase 5 — from Lambda ground truth |
 | `LOKI_INSTANCE_ID` | (dynamic) | Phase 6.2 SSM target |
 
 If any value here is `None`, `""`, or auto-discovered incorrectly — STOP, narrate
@@ -1025,8 +1014,8 @@ build_overrides() {
     local id_refresh="$1"
     local out="$2"
 
-    # Build command array — include optional args only when set
-    local cmd_jq='["scrapy","crawl","conso_outlet_detail",
+    # Build command array — matches Lambda format (python3 -m scrapy runspider, NOT scrapy crawl)
+    local cmd_jq='["python3","-m","scrapy","runspider","conso_outlet_detail.py",
                    "-a", ("prefix=" + $prefix),
                    "-a", ("output_month=" + $month),
                    "-a", ("recrawl=" + $recrawl),
@@ -1041,23 +1030,31 @@ build_overrides() {
         cmd_jq="$cmd_jq + [\"-a\", (\"sample=\" + (\$sample|tostring))]"
     fi
 
+    # Overrides: env vars → log_router, command → spider container (matches Lambda)
     jq -n \
         --arg prefix     "$PREFIX" \
         --arg month      "$OUTPUT_MONTH" \
         --arg recrawl    "$RECRAWL" \
         --arg id_refresh "$id_refresh" \
         --arg platform   "$ID_PLATFORM" \
-        --arg service    "$SERVICE_NAME" \
+        --arg container  "$CONTAINER_NAME" \
+        --arg now        "$(date -u +'%Y-%m-%d %H:%M')" \
         --argjson sample "${SAMPLE:-0}" \
         "{
-           containerOverrides: [{
-             name: \"ggm_app\",
-             command: $cmd_jq,
-             environment: [
-               {name: \"Platform\",     value: \$platform},
-               {name: \"SERVICE_NAME\", value: \$service}
-             ]
-           }]
+           containerOverrides: [
+             {
+               name: \"log_router\",
+               environment: [
+                 {name: \"LOG_STREAM\", value: \$prefix},
+                 {name: \"Platform\",   value: \$platform},
+                 {name: \"Time\",       value: \$now}
+               ]
+             },
+             {
+               name: \$container,
+               command: $cmd_jq
+             }
+           ]
          }" > "$out"
 }
 
@@ -1068,11 +1065,12 @@ build_overrides "True" "$OV_FILE"
 # Build network config — uses SUBNET_IDS / SG_IDS from Phase 0 (dynamic)
 NET_CFG="awsvpcConfiguration={subnets=[${SUBNET_IDS}],securityGroups=[${SG_IDS}],assignPublicIp=ENABLED}"
 
-# Launch
+# Launch (matches Lambda: cluster=sourcing, platformVersion=LATEST)
 TASK_ARN=$(aws ecs run-task \
     --cluster "$CLUSTER" \
     --task-definition "$TASK_DEF_ARN" \
     --launch-type FARGATE \
+    --platform-version LATEST \
     --network-configuration "$NET_CFG" \
     --overrides "file://$OV_FILE" \
     --region "$AWS_REGION" \
