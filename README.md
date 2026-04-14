@@ -10,16 +10,17 @@ so a complete migration doesn't require remembering 30 commands.
 
 ---
 
-## The 6 Skills (in execution order)
+## The 7 Skills (in execution order)
 
 | # | Skill | Purpose | Key Files |
 |--:|---|---|---|
 | 1 | [parse-workflow](parse-workflow/) | Analyze a reverse-engineered crawler, write `finder_parse.py` + `detail_parse.py` for a new food-delivery platform. Outputs `handoff.json` for the next step. | `SKILL.md`, `workflow.md`, `scripts/validate_handoff.py`, `validate_output.py` |
 | 2 | [conso-migrate](conso-migrate/) | Take any crawler (Scrapy, Postman, Bruno, JS, Go…) and migrate it to the ConSo standard — spider code, Dockerfile, CI/CD, MySQL/Redis setup. Reads `handoff.json` if present. | `SKILL.md`, 13 templates |
-| 3 | [conso-deploy](conso-deploy/) | Deploy a migrated ConSo project to AWS — ECR repo, GitHub Actions, CloudWatch logs, EventBridge cron rules, CASS activation. | `SKILL.md` |
-| 4 | [run-detail](run-detail/) | Trigger ad-hoc detail spider runs on Fargate. Smart entry, multi-instance, OOM auto-recovery, post-run S3/MySQL data verification. | `SKILL.md` |
-| 5 | [id-refresh](id-refresh/) | Re-crawl a specific list of outlet IDs (from CSV). Dual mode: local Python or Fargate. Race-checked Redis push, ID-level landing verification. | `SKILL.md`, `scripts/id_refresh.py` |
-| 6 | [trigger-qa](trigger-qa/) | Trigger the sourcing QA pipeline (Lambda → EMR). Smart entry detects duplicate triggers, optional `--wait-for-completion` polls cluster through terminal state. | `SKILL.md`, `scripts/trigger_qa_pipeline.py` |
+| 3 | [grid-gen](grid-gen/) | Generate hexagonal (H3) grid points for finder spiders. Covers scope definition, S3 upload, Redis push, CASS update, and `push_grids.py` sync. Dual mode: FULL (spider project) or GENERATE-ONLY (pre-migration). | `SKILL.md`, `scripts/generate_grid.py` |
+| 4 | [conso-deploy](conso-deploy/) | Deploy a migrated ConSo project to AWS — ECR repo, GitHub Actions, CloudWatch logs, EventBridge cron rules, CASS activation. | `SKILL.md` |
+| 5 | [run-detail](run-detail/) | Trigger ad-hoc detail spider runs on Fargate. Smart entry, multi-instance, OOM auto-recovery, post-run S3/MySQL data verification. | `SKILL.md` |
+| 6 | [id-refresh](id-refresh/) | Re-crawl a specific list of outlet IDs (from CSV). Dual mode: local Python or Fargate. Race-checked Redis push, ID-level landing verification. | `SKILL.md`, `scripts/id_refresh.py` |
+| 7 | [trigger-qa](trigger-qa/) | Trigger the sourcing QA pipeline (Lambda → EMR). Smart entry detects duplicate triggers, optional `--wait-for-completion` polls cluster through terminal state. | `SKILL.md`, `scripts/trigger_qa_pipeline.py` |
 
 ---
 
@@ -39,25 +40,29 @@ so a complete migration doesn't require remembering 30 commands.
                   │  • reads handoff.json (Phase 0.01) │
                   │  • generates spider + Dockerfile   │
                   │  • migrates MySQL/Redis            │
-                  └─────────────────┬──────────────────┘
-                                    │ ~/.claude/state/
-                                    ▼
-                  ┌────────────────────────────────────┐
-                  │  conso-deploy                      │
-                  │  • ECR + GitHub Actions            │
-                  │  • EventBridge monthly cron        │
-                  │  • Phase 5.5 deploy-time smoke test│
-                  └─────────────────┬──────────────────┘
-                                    │
-                ┌───────────────────┼───────────────────┐
-                ▼                   ▼                   ▼
-        ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-        │  run-detail   │   │  id-refresh   │   │  trigger-qa   │
-        │  full crawls  │   │  targeted fix │   │  QA validate  │
-        └───────────────┘   └───────────┬───┘   └───────▲───────┘
-                                        │               │
-                                        └───────────────┘
-                                        chain to QA after data fix
+                  └──────────┬─────────────────────────┘
+                             │ ~/.claude/state/
+               ┌─────────────┤
+               ▼             ▼
+  ┌──────────────────┐  ┌────────────────────────────────────┐
+  │  grid-gen        │  │  conso-deploy                      │
+  │  • H3 hex grid   │  │  • ECR + GitHub Actions            │
+  │  • S3 + Redis    │  │  • EventBridge monthly cron        │
+  │  • CASS update   │  │  • Phase 5.5 deploy-time smoke test│
+  └──────────────────┘  └─────────────────┬──────────────────┘
+    ▲ also usable                         │
+    │ pre-migration         ┌─────────────┼───────────────┐
+    │ (GENERATE-ONLY)       ▼             ▼               ▼
+    │               ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+    │               │  run-detail   │ │  id-refresh   │ │  trigger-qa   │
+    │               │  full crawls  │ │  targeted fix │ │  QA validate  │
+    │               └───────────────┘ └───────────┬───┘ └───────▲───────┘
+    │                                             │             │
+    │                                             └─────────────┘
+    │                                             chain to QA after data fix
+    │
+    └── grid-gen can also run standalone before conso-migrate
+        (GENERATE-ONLY mode: grid + S3 upload, no Redis/CASS)
 ```
 
 Each arrow represents a **state-file handoff**:
@@ -158,7 +163,7 @@ operations.
 To keep the local copy in sync with this repo, after a `git pull`:
 
 ```bash
-for skill in conso-deploy conso-migrate id-refresh parse-workflow run-detail trigger-qa; do
+for skill in conso-deploy conso-migrate grid-gen id-refresh parse-workflow run-detail trigger-qa; do
     rm -rf ~/.claude/skills/$skill
     cp -r $(pwd)/$skill ~/.claude/skills/
 done
