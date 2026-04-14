@@ -1475,6 +1475,16 @@ and re-enable before Phase 13 (pre-deploy check in Phase 12.5 enforces this).
 
 ### Step 1 — Finder spider (if exists)
 
+**Snapshot MySQL BEFORE the crawl** — needed to detect silent write failures:
+
+```bash
+MYSQL_BEFORE=$(python ~/.claude/commands/conso-migrate/check_mysql.py \
+    --platform "$ID_PLATFORM" --prefixes "$FIRST_PREFIX" --json 2>/dev/null)
+
+BEFORE_COUNT=$(echo "$MYSQL_BEFORE" | python -c "import sys,json; d=json.load(sys.stdin)[0]; print(d['count'] if d['exists'] else 0)" 2>/dev/null || echo 0)
+echo "MySQL $FIRST_PREFIX before: $BEFORE_COUNT rows"
+```
+
 `CLOSESPIDER_ITEMCOUNT=1` discovers 1 outlet and stops.
 With MongoDBPipeline active it writes the feed item to MongoDB instead of MySQL.
 ```bash
@@ -1493,6 +1503,50 @@ If this returns **no match** (i.e. `Crawled 0 pages` for the whole run) while
 — Hard Rule R1 violation. Go back to Phase 8.1, port all synchronous HTTP calls
 (`requests`/`httpx`/`curl_cffi`/`tls_client`) to `yield scrapy.Request(...)`.
 The smoke will pass locally but production will silently drop all data.
+
+**MySQL write verification — compare before/after finder run:**
+
+The finder writes outlet IDs to MySQL via `RDSPipeline`. A crawl that "succeeds"
+locally (items scraped > 0) but writes 0 rows to MySQL is the #1 silent-failure
+pattern (YDE/LMN incident). Catch it HERE — not 13 days later in production.
+
+```bash
+# Snapshot BEFORE was captured above; now check AFTER
+MYSQL_AFTER=$(python ~/.claude/commands/conso-migrate/check_mysql.py \
+    --platform "$ID_PLATFORM" --prefixes "$FIRST_PREFIX" --json 2>/dev/null)
+
+AFTER_COUNT=$(echo "$MYSQL_AFTER" | python -c "import sys,json; print(json.load(sys.stdin)[0]['count'])")
+```
+
+**Intelligent verdict — Claude decides what to do, not the user:**
+
+| Condition | Verdict | Action |
+|---|---|---|
+| `AFTER_COUNT > BEFORE_COUNT` | ✅ MySQL writes confirmed | Proceed to Step 2 |
+| `AFTER_COUNT == BEFORE_COUNT` AND `scraped > 0` | ❌ Silent write failure | **STOP.** Do NOT proceed. Run the diagnostic checklist below — the cause is almost always `DB = PLATFORM` missing or `tablename` mismatch. This is the exact YDE/LMN pattern. |
+| `AFTER_COUNT == BEFORE_COUNT` AND `scraped == 0` | ⚠️ Finder found nothing | Check: are grids pushed for this prefix? Is the API returning empty results? Is the proxy blocked? |
+| `BEFORE_COUNT` was 0 AND `AFTER_COUNT > 0` | ✅ First data for this prefix | Note: new prefix table was auto-created. Verify table schema matches `items.py` fields. |
+| Table does not exist | ❌ Missing table | Either `DB = PLATFORM` is wrong (connecting to wrong database) or this is a brand-new platform. Check `settings.py`. |
+
+**When verdict is ❌ — auto-diagnose before asking the user:**
+
+Don't just report "MySQL writes failed". Run the root-cause checklist automatically:
+
+```bash
+# 1. Is DB = PLATFORM set?
+grep -n "^DB\s*=" {id_platform}/settings.py || echo "❌ CAUSE FOUND: DB = PLATFORM missing"
+
+# 2. Does FeedItem.tablename match 'outlet_feeds'?
+grep -n "tablename" {id_platform}/items.py | grep -i "feed"
+
+# 3. Was RDSPipeline actually enabled?
+grep -n "RDSPipeline" {id_platform}/spiders/conso_outlet_finder.py
+
+# 4. Check the smoke log for errors
+grep -iE "error|exception|traceback|failed" /tmp/finder_smoke.log | head -10
+```
+
+Report the diagnosed cause, not just the symptom. Fix it, then re-run Step 1.
 
 ### Step 2 — Detail spider
 
@@ -1670,21 +1724,40 @@ rm -f /tmp/sk_cookie.txt
 Scrapy's `scraped N items` counter is a **liar**: it increments even when every
 item is silently dropped by the pipeline. Only MySQL itself is authoritative.
 
-Within 15 minutes of starting the finder, verify:
+**Immediately after starting the finder** — take a baseline snapshot:
 
 ```bash
-poetry run python - <<'PYEOF'
-from dashmote_sourcing.db import MySQLClient
-with MySQLClient.get_connection_context(db_name='{id_platform}') as c:
-    cur = c.cursor()
-    cur.execute("SELECT COUNT(*), MAX(last_refresh) FROM {first_prefix}")
-    print(cur.fetchone())
-PYEOF
+python ~/.claude/commands/conso-migrate/check_mysql.py \
+    --platform "$ID_PLATFORM" --prefixes "$FIRST_PREFIX" --json \
+    > /tmp/mysql_baseline_${ID_PLATFORM}_${FIRST_PREFIX}.json
 ```
 
-Row count must be growing AND `MAX(last_refresh)` must be within the last few
-minutes. If not, **stop the job and run the diagnostic checklist below** —
-never "let it run, maybe it'll start writing". It won't.
+**Within 15 minutes** — verify growth with `--since 15`:
+
+```bash
+python ~/.claude/commands/conso-migrate/check_mysql.py \
+    --platform "$ID_PLATFORM" --prefixes "$FIRST_PREFIX" --since 15
+```
+
+**Intelligent verdict — Claude auto-decides, don't dump raw output:**
+
+| `--since 15` Recent column | Meaning | Action |
+|---|---|---|
+| `> 0` | ✅ MySQL is actively receiving writes | Proceed to Phase 13.6 or finish |
+| `== 0` but total rows grew vs baseline | ⚠️ Writes happened but stopped | Check SpiderKeeper log — spider may have finished or crashed. Re-run `--since 5` in a few minutes. |
+| `== 0` AND total rows unchanged | ❌ **Silent write failure (YDE/LMN pattern)** | **STOP the job immediately.** Run Phase 13.6 diagnostic checklist. Never "let it run, maybe it'll start writing" — it won't. |
+| Table does not exist | ❌ **DB misconfiguration** | `DB = PLATFORM` is wrong or missing. Check `settings.py` first. |
+
+**When verdict is ❌ — auto-diagnose before escalating:**
+
+Don't ask the user "MySQL writes failed, what do you want to do?" — run the
+root-cause checklist in Phase 13.6 automatically, identify the cause, propose
+the fix, and only ask if the fix requires a code change + redeploy.
+
+```bash
+# Cleanup baseline after verification
+rm -f /tmp/mysql_baseline_${ID_PLATFORM}_${FIRST_PREFIX}.json
+```
 
 ### 13.6 — **Silent-failure diagnostic checklist (run in order)**
 

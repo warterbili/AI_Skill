@@ -120,6 +120,7 @@ that touches an invariant, verify the fields match Phase 0's resolved table.
 | **I5** | `sample=0` confirmed by user → writes to `s3://dash-sourcing/…` (PROD); `sample>0` → writes to `s3://dash-alpha-dev/sample/…` (DEV) | Phase 2 Q5, Phase 4.5 G5, Phase 7.1 | Accidentally pushing test data to prod bucket (or worse, prod data to test) |
 | **I6** | **Exactly ONE** task per `(platform, prefix, month)` has `id_refresh=True`; all workers are `id_refresh=False` | Phase 2 id_refresh table, 5.1, 5.1b | Multiple tasks try to populate Redis → queue state clash → duplicated/missed outlets |
 | **I7** | `AWS_ACCOUNT_ID` resolved in Phase 0 ≡ account MFA authenticated to ≡ account owning ECR/ECS/Subnets | Phase 0, 3.1, 4.1, 5.1 | Cross-account references → silently resolve to nothing, task launch fails with cryptic error |
+| **I8** | MySQL finder data exists AND is fresh for the target prefix | Phase 0.6 preflight, Phase 2 Q1 default | detail's `filter()` returns 0 outlets → task exits immediately with 0 items scraped, ~$2-5 wasted on Fargate startup |
 
 **Rule of thumb:** after every AWS call, grep output for the invariant's fields
 and assert they match Phase 0. If an assertion fails, STOP and narrate — don't
@@ -256,6 +257,73 @@ fi
 
 If any value here is `None`, `""`, or auto-discovered incorrectly — STOP, narrate
 which variable, ask the user to confirm.
+
+### 0.6 — MySQL Finder Data Preflight
+
+> **Why this is here:** detail's `self.filter()` reads outlet IDs from MySQL.
+> If the finder never wrote data (table empty/missing), or hasn't run recently
+> (stale data = re-crawling outlets that no longer exist), detail will either
+> exit immediately with 0 tasks or waste time on dead outlets. Catching this
+> BEFORE launching a Fargate task saves ~$2-5 per wasted run and 15+ minutes
+> of waiting for a task that was doomed from the start.
+
+**This check is silent and automatic — do NOT ask the user before running it.**
+
+```bash
+# Auto-discover all prefixes for this platform, or check just the target if known
+CHECK_PREFIXES="${PREFIX:-}"   # PREFIX may not be set yet — that's OK
+
+MYSQL_STATUS=$(python ~/.claude/commands/conso-migrate/check_mysql.py \
+    --platform "$ID_PLATFORM" \
+    ${CHECK_PREFIXES:+--prefixes "$CHECK_PREFIXES"} \
+    --json 2>/dev/null)
+```
+
+**Intelligent triage — Claude reasons about the data, not just displays it:**
+
+For each prefix in the result, classify into one of these buckets:
+
+| Condition | Classification | What Claude does |
+|---|---|---|
+| `exists=false` | ❌ **No finder data** | STOP before launch. Tell user: "No MySQL table for {prefix} — finder has never run for this country. Run finder first, or check if `DB = PLATFORM` is set in settings.py." |
+| `count=0` | ❌ **Empty table** | Same as above — finder ran but wrote nothing (silent failure pattern). |
+| `last_refresh` > 30 days ago | ⚠️ **Stale data** | Warn user: "Finder data for {prefix} is {N} days old (last: {date}). Detail will re-crawl outlets that may no longer exist. Consider running finder first." Let user decide — don't block. |
+| `last_refresh` > 7 days ago | ℹ️ **Aging data** | Note it in the variable table but don't warn — 7 days is normal for monthly crawl cycles. |
+| `last_refresh` within 7 days AND `count > 0` | ✅ **Fresh data** | Proceed silently — don't print anything extra. |
+
+**Cross-referencing with Phase 1 (smart entry):**
+
+If Phase 1 finds a RUNNING detail task for the same prefix, AND MySQL shows
+the data is fresh — the previous task is probably fine; suggest monitoring it
+instead of launching a duplicate (save money).
+
+If Phase 1 finds a recently STOPPED task that failed, AND MySQL shows the data
+is stale — the failure might be caused by stale finder data, not a spider bug.
+Suggest re-running finder before re-launching detail.
+
+**Multi-prefix awareness:**
+
+When no specific prefix is given yet (user hasn't answered Q1), run the check
+for ALL discovered prefixes. Use the result to:
+1. Pre-fill the default prefix suggestion in Q1 — pick the prefix with the
+   most rows AND fresh data (best chance of a successful detail run).
+2. Flag any prefixes that would fail before the user picks them.
+3. If ALL prefixes are ❌, tell the user upfront: "No usable finder data for
+   any {ID_PLATFORM} country. Detail cannot run until finder writes data."
+
+**Print the summary only if there's something worth saying:**
+
+```
+# Only if warnings/errors exist:
+📊 MySQL Finder Status for {ID_PLATFORM}:
+  ✅ NL: 42,687 rows (9h ago)
+  ✅ DE: 131,150 rows (9h ago)
+  ⚠️ AT: 15,773 rows (2d ago) — consider re-running finder
+  ❌ PT: table does not exist — finder never ran
+
+# If all green, just one line:
+✅ MySQL finder data OK for {ID_PLATFORM} ({N} prefixes, all fresh)
+```
 
 ---
 
