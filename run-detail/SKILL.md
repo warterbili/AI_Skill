@@ -301,6 +301,29 @@ If Phase 1 finds a recently STOPPED task that failed, AND MySQL shows the data
 is stale — the failure might be caused by stale finder data, not a spider bug.
 Suggest re-running finder before re-launching detail.
 
+**When MySQL shows ⚠️ stale or ❌ — auto-diagnose via SpiderKeeper:**
+
+Don't just report "data is stale" — find out WHY by checking whether the
+finder is actually running on SpiderKeeper:
+
+```bash
+SK_STATUS=$(python ~/.claude/commands/conso-migrate/check_spiderkeeper.py \
+    --platform "$ID_PLATFORM" --with-mysql \
+    ${CHECK_PREFIXES:+--prefixes "$CHECK_PREFIXES"} \
+    --json 2>/dev/null)
+```
+
+| SpiderKeeper | MySQL | What Claude tells the user |
+|---|---|---|
+| RUNNING + healthy | ✅ fresh | Nothing — proceed silently |
+| RUNNING + stalled | ⚠️ stale | "Finder for {prefix} is running but stalled ({age} since last write). IDs may be incomplete. Proceed with caution or investigate finder first." |
+| RUNNING + zombie | ❌ very stale | "Finder for {prefix} is a zombie (running {runtime} but last write {age} ago). Stop it on SpiderKeeper and restart with fresh grids." |
+| NOT RUNNING | ⚠️/❌ stale | "Finder for {prefix} is not running on SpiderKeeper. MySQL data is {age} old. Start finder first if you need fresh IDs." |
+| NOT RUNNING | ✅ fresh | Fine — finder finished recently, data is usable |
+
+This replaces the generic "consider re-running finder" advice with a specific
+diagnosis: is the finder alive, dead, or stuck?
+
 **Multi-prefix awareness:**
 
 When no specific prefix is given yet (user hasn't answered Q1), run the check

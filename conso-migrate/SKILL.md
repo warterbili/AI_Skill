@@ -1748,6 +1748,23 @@ python ~/.claude/commands/conso-migrate/check_mysql.py \
 | `== 0` AND total rows unchanged | ❌ **Silent write failure (YDE/LMN pattern)** | **STOP the job immediately.** Run Phase 13.6 diagnostic checklist. Never "let it run, maybe it'll start writing" — it won't. |
 | Table does not exist | ❌ **DB misconfiguration** | `DB = PLATFORM` is wrong or missing. Check `settings.py` first. |
 
+**When verdict is ❌ or ⚠️ — cross-check SpiderKeeper automatically:**
+
+Before running the Phase 13.6 diagnostic checklist, first confirm the finder
+job is actually alive on SpiderKeeper:
+
+```bash
+python ~/.claude/commands/conso-migrate/check_spiderkeeper.py \
+    --platform "$ID_PLATFORM" --with-mysql --prefixes "$FIRST_PREFIX"
+```
+
+| SpiderKeeper status | MySQL status | Diagnosis |
+|---|---|---|
+| RUNNING + MySQL writing | ✅ | All good — finder is alive and productive |
+| RUNNING + MySQL stalled (>24h) | ⚠️ | Finder process alive but stuck — check Redis grids, proxy bans, or API blocks |
+| RUNNING + MySQL never wrote | ❌ | Silent failure — run Phase 13.6 checklist (DB=PLATFORM, tablename, RDSPipeline) |
+| NOT RUNNING + MySQL stale | ❌ | Finder job died or was never started — check SpiderKeeper dashboard, re-schedule |
+
 **When verdict is ❌ — auto-diagnose before escalating:**
 
 Don't ask the user "MySQL writes failed, what do you want to do?" — run the
