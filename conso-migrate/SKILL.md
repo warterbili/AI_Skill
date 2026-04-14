@@ -1475,6 +1475,29 @@ and re-enable before Phase 13 (pre-deploy check in Phase 12.5 enforces this).
 
 ### Step 1 — Finder spider (if exists)
 
+**Pre-check: are grids in Redis?**
+
+Before running the finder, verify grids have been pushed. Don't ask the user
+"did you push grids?" — check programmatically:
+
+```bash
+python ~/.claude/commands/conso-migrate/check_redis.py \
+    --platform "$ID_PLATFORM" --prefixes "$FIRST_PREFIX"
+```
+
+**Claude's decision logic — not a display, a gate:**
+
+- Key exists (any ZCARD, including 0) → ✅ Grids were pushed. Proceed.
+  ZCARD=0 is normal — finder uses `pop_and_push_grid` round-cycling,
+  so grids are temporarily out of the sorted set while being processed.
+- Key doesn't exist (ZCARD=0 AND no key) → ❌ Grids never pushed.
+  **STOP.** Go back to Phase 7 and run `push_grids.py` first. Running
+  the finder without grids will exit immediately with 0 items — wasting
+  time and making it look like the spider is broken when it isn't.
+
+If this is a new migration and Phase 7 was just completed, this check
+also serves as **validation that push_grids.py worked correctly**.
+
 **Snapshot MySQL BEFORE the crawl** — needed to detect silent write failures:
 
 ```bash
@@ -1656,60 +1679,76 @@ that each gate prevents.
 
 ## Phase 13 — SpiderKeeper Deployment (finder only, skip otherwise)
 
-### 13.1 Build .egg
+### 13.1–13.4 — Build, upload, and start finder (automated)
+
+All of Phase 13.1–13.4 is now handled by `manage_spiderkeeper.py`. One command
+to deploy, one to start — no manual curl, no session cookie dance, no copy-paste
+of auth tokens.
+
+**Step 1 — Deploy .egg:**
+
 ```bash
-scrapyd-deploy --build-egg output.egg
+python ~/.claude/commands/conso-migrate/manage_spiderkeeper.py deploy \
+    --platform "$ID_PLATFORM"
 ```
 
-### 13.2 Get auth token from Secrets Manager
-```bash
-poetry run python -c "
-from dashmote_sourcing.db import SecretsManager
-print(SecretsManager.get_secret('Conso_SpiderKeeper', region_name='eu-central-1')['Authorization'])
-"
-```
+This builds the `.egg`, uploads it to SpiderKeeper, and verifies the spiders
+are registered. If the project doesn't exist yet, create it first:
 
-### 13.3 Create project if it doesn't exist
 ```bash
-curl -s -H "Authorization: {auth_token}" \
-    http://spider.getdashmote.com:1234/api/projects
-```
-If `ConSo_{id_platform}` is not in the response:
-```bash
-curl -s -H "Authorization: {auth_token}" -X POST \
+# Only if deploy says "Project not found":
+SK_AUTH=$(python -c "from dashmote_sourcing.db import SecretsManager; print(SecretsManager.get_secret('Conso_SpiderKeeper', region_name='eu-central-1')['Authorization'])")
+curl -s --noproxy "*" -H "Authorization: $SK_AUTH" -X POST \
     http://spider.getdashmote.com:1234/api/projects \
     -d "project_name=ConSo_{id_platform}"
-```
-Parse the returned `project_id`.
-
-### 13.4 Upload .egg
-
-SpiderKeeper uses Flask session to track the current project. The session must be
-seeded by a GET to the correct project's deploy page before the upload POST,
-otherwise the egg is routed to whichever project the server session last saw.
-
-```bash
-# Step 1 — seed session cookie for the correct project
-curl -sc /tmp/sk_cookie.txt --noproxy "*" \
-    -H "Authorization: {auth_token}" \
-    "http://spider.getdashmote.com:1234/project/{project_id}/spider/deploy" -o /dev/null
-
-# Step 2 — upload egg with session cookie (field name is "file", not "egg")
-curl -s --noproxy "*" -X POST \
-    -H "Authorization: {auth_token}" \
-    -b /tmp/sk_cookie.txt -c /tmp/sk_cookie.txt \
-    -F "file=@output.egg" \
-    "http://spider.getdashmote.com:1234/project/{project_id}/spider/upload"
+# Then re-run deploy
 ```
 
-Check for `deploy success!` in the response. Then verify spiders are registered:
+**Step 2 — Start finder for all prefixes:**
+
 ```bash
-curl -s --noproxy "*" -H "Authorization: {auth_token}" \
-    http://spider.getdashmote.com:1234/api/projects/{project_id}/spiders
+python ~/.claude/commands/conso-migrate/manage_spiderkeeper.py start \
+    --platform "$ID_PLATFORM" --prefix "{all_prefixes_comma_separated}"
 ```
-Confirm `conso_outlet_finder` appears in the response, then delete the temp cookie:
+
+The script auto-detects already-running finders and skips them (no duplicates).
+Use `--force` only if you intentionally want parallel finders for the same prefix.
+
+**Step 3 — Verify finder is alive:**
+
 ```bash
-rm -f /tmp/sk_cookie.txt
+python ~/.claude/commands/conso-migrate/check_spiderkeeper.py \
+    --platform "$ID_PLATFORM" --with-mysql
+```
+
+**Claude's decision chain after deploy + start:**
+
+| check_spiderkeeper result | Next action |
+|---|---|
+| All prefixes ✅ RUNNING + MySQL writing | Proceed to Phase 13.5 (15-min verification) |
+| Some prefixes NOT RUNNING | Script may have failed — check SpiderKeeper dashboard. Re-run `start` for missing prefixes. |
+| RUNNING but MySQL not writing after 5 min | Don't wait — jump directly to Phase 13.6 diagnostic checklist. The deploy may have a `DB=PLATFORM` or `tablename` issue. |
+
+**Handling existing finders from a previous deployment:**
+
+If `check_spiderkeeper` shows finders already RUNNING from a prior deploy, Claude
+should reason about whether to stop-and-restart or leave them:
+
+| Existing finder state | New code deployed? | Action |
+|---|---|---|
+| RUNNING + healthy (MySQL fresh) | Yes, code changed | Stop old → start new (old code is stale) |
+| RUNNING + healthy (MySQL fresh) | No code change (re-deploy) | Leave running — no reason to restart |
+| RUNNING + stalled (MySQL >24h) | Any | Stop → start (it's stuck anyway) |
+| RUNNING + zombie (MySQL >30d) | Any | Stop immediately, then start new |
+
+```bash
+# Stop stale finders before restarting:
+python ~/.claude/commands/conso-migrate/manage_spiderkeeper.py stop \
+    --platform "$ID_PLATFORM" --prefix "{stale_prefixes}"
+
+# Then start fresh:
+python ~/.claude/commands/conso-migrate/manage_spiderkeeper.py start \
+    --platform "$ID_PLATFORM" --prefix "{stale_prefixes}"
 ```
 
 ### 13.5 — **Post-deploy MySQL verification (15-min rule)**

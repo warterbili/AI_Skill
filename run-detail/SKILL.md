@@ -301,10 +301,13 @@ If Phase 1 finds a recently STOPPED task that failed, AND MySQL shows the data
 is stale — the failure might be caused by stale finder data, not a spider bug.
 Suggest re-running finder before re-launching detail.
 
-**When MySQL shows ⚠️ stale or ❌ — auto-diagnose via SpiderKeeper:**
+**When MySQL shows ⚠️ stale or ❌ — run the cascading diagnostic chain:**
 
-Don't just report "data is stale" — find out WHY by checking whether the
-finder is actually running on SpiderKeeper:
+Don't just report "data is stale". Don't just check one more tool. Run a
+**decision tree** where each result determines the next step — and if the
+fix is automatable, do it (with user confirmation for destructive actions).
+
+**Layer 1 — SpiderKeeper: is the finder alive?**
 
 ```bash
 SK_STATUS=$(python ~/.claude/commands/conso-migrate/check_spiderkeeper.py \
@@ -313,16 +316,75 @@ SK_STATUS=$(python ~/.claude/commands/conso-migrate/check_spiderkeeper.py \
     --json 2>/dev/null)
 ```
 
-| SpiderKeeper | MySQL | What Claude tells the user |
-|---|---|---|
-| RUNNING + healthy | ✅ fresh | Nothing — proceed silently |
-| RUNNING + stalled | ⚠️ stale | "Finder for {prefix} is running but stalled ({age} since last write). IDs may be incomplete. Proceed with caution or investigate finder first." |
-| RUNNING + zombie | ❌ very stale | "Finder for {prefix} is a zombie (running {runtime} but last write {age} ago). Stop it on SpiderKeeper and restart with fresh grids." |
-| NOT RUNNING | ⚠️/❌ stale | "Finder for {prefix} is not running on SpiderKeeper. MySQL data is {age} old. Start finder first if you need fresh IDs." |
-| NOT RUNNING | ✅ fresh | Fine — finder finished recently, data is usable |
+**Layer 2 — Redis: are there grids to process?**
 
-This replaces the generic "consider re-running finder" advice with a specific
-diagnosis: is the finder alive, dead, or stuck?
+Only run this if Layer 1 shows RUNNING but stalled — it helps distinguish
+"finder has nothing to crawl" from "finder is stuck on a request":
+
+```bash
+python ~/.claude/commands/conso-migrate/check_redis.py \
+    --platform "$ID_PLATFORM" \
+    ${CHECK_PREFIXES:+--prefixes "$CHECK_PREFIXES"}
+```
+
+Note: ZCARD=0 is **normal** for finder round-cycling (pop_and_push_grid).
+The grid key existing (even with ZCARD=0) means grids were pushed. Only
+"key doesn't exist" is a real problem.
+
+**Layer 3 — Action: fix it or inform the user**
+
+Claude chains the layers into a single diagnosis. The user sees one message,
+not three tool outputs:
+
+```
+Layer 1: SpiderKeeper     Layer 2: Redis        → Claude's action
+─────────────────────     ──────────────         ───────────────────────────
+RUNNING + MySQL fresh     (skip)                 ✅ Proceed silently
+RUNNING + MySQL stalled   grids key exists       ⚠️ "Finder alive but stalled.
+                                                    Likely stuck on a request or
+                                                    proxy ban. Detail can proceed
+                                                    with existing IDs, but data
+                                                    may be incomplete."
+RUNNING + MySQL stalled   grids key missing      ❌ "Finder running but no grids
+                                                    in Redis — it's spinning with
+                                                    nothing to do. Push grids first,
+                                                    then detail will have fresh IDs."
+RUNNING + MySQL zombie    (skip)                 ❌ Ask user: "Finder is zombie
+                                                    ({runtime} running, {age} since
+                                                    last write). Stop it and restart?
+                                                    [y/N]"
+                                                    If yes →
+                                                    manage_spiderkeeper.py stop
+                                                    manage_spiderkeeper.py start
+NOT RUNNING               MySQL fresh            ✅ Fine — finder finished
+                                                    recently, IDs are usable
+NOT RUNNING               MySQL stale            ⚠️ Ask user: "Finder not running,
+                                                    MySQL data is {age} old. Start
+                                                    finder now? [y/N]"
+                                                    If yes →
+                                                    manage_spiderkeeper.py start
+NOT RUNNING               MySQL empty/missing    ❌ BLOCK. "No finder data and no
+                                                    finder running. Deploy finder
+                                                    first (/conso-migrate Phase 13
+                                                    or manage_spiderkeeper.py deploy
+                                                    + start)."
+```
+
+**The key principle: Claude resolves the issue, not just reports it.**
+
+When the diagnosis leads to "stop zombie and restart" or "start finder",
+Claude should offer to do it — one confirmation from the user, then execute
+via `manage_spiderkeeper.py`. No manual SpiderKeeper dashboard needed.
+
+```bash
+# Stop zombie finder:
+python ~/.claude/commands/conso-migrate/manage_spiderkeeper.py stop \
+    --platform "$ID_PLATFORM" --prefix "{stalled_prefix}"
+
+# Start fresh finder:
+python ~/.claude/commands/conso-migrate/manage_spiderkeeper.py start \
+    --platform "$ID_PLATFORM" --prefix "{prefix}"
+```
 
 **Multi-prefix awareness:**
 
