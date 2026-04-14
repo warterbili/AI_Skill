@@ -133,21 +133,33 @@ def format_datetime(dt) -> str:
 
 
 def age_label(dt) -> str:
-    """Human-readable age of a datetime."""
+    """Precise human-readable age: e.g. '1d 3h 25m ago'."""
     if dt is None:
         return ''
     now = datetime.now()
     delta = now - dt
-    if delta.total_seconds() < 3600:
-        return f'{int(delta.total_seconds() / 60)}m ago'
-    elif delta.days == 0:
-        return f'{int(delta.total_seconds() / 3600)}h ago'
-    elif delta.days < 30:
-        return f'{delta.days}d ago'
-    elif delta.days < 365:
-        return f'{delta.days // 30}mo ago'
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 0:
+        return 'future?'
+
+    days = delta.days
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+
+    if days >= 365:
+        years = days // 365
+        remaining_days = days % 365
+        return f'{years}y {remaining_days}d ago'
+    elif days >= 30:
+        months = days // 30
+        remaining_days = days % 30
+        return f'{months}mo {remaining_days}d ago'
+    elif days > 0:
+        return f'{days}d {hours}h {minutes}m ago'
+    elif hours > 0:
+        return f'{hours}h {minutes}m ago'
     else:
-        return f'{delta.days // 365}y ago'
+        return f'{minutes}m ago'
 
 
 def status_icon(result: dict, since_minutes: int) -> str:
@@ -256,8 +268,8 @@ def main():
     print()
 
     hdr_since = f'  {"Recent":>8}' if args.since else ''
-    print(f"  {'':>2} {'Prefix':<8} {'Rows':>10} {'Last Refresh':>22} {'Age':>10}{hdr_since}  {'Notes'}")
-    print(f"  {'':>2} {'─' * 6:<8} {'─' * 10:>10} {'─' * 22:>22} {'─' * 10:>10}{'  ' + '─' * 8 if args.since else ''}  {'─' * 20}")
+    print(f"  {'':>2} {'Prefix':<8} {'Rows':>10} {'Last Refresh':>22} {'Age':>18}{hdr_since}  {'Notes'}")
+    print(f"  {'':>2} {'─' * 6:<8} {'─' * 10:>10} {'─' * 22:>22} {'─' * 18:>18}{'  ' + '─' * 8 if args.since else ''}  {'─' * 20}")
 
     for r in results:
         icon = status_icon(r, args.since)
@@ -265,12 +277,12 @@ def main():
         since_col = f'  {r["recent_count"]:>8}' if args.since and r['recent_count'] is not None else (f'  {"—":>8}' if args.since else '')
 
         if not r['exists']:
-            print(f"  {icon} {r['prefix']:<8} {'—':>10} {'—':>22} {'—':>10}{since_col}  table does not exist")
+            print(f"  {icon} {r['prefix']:<8} {'—':>10} {'—':>22} {'—':>18}{since_col}  table does not exist")
         elif r['error']:
-            print(f"  {icon} {r['prefix']:<8} {'—':>10} {'—':>22} {'—':>10}{since_col}  {r['error'][:30]}")
+            print(f"  {icon} {r['prefix']:<8} {'—':>10} {'—':>22} {'—':>18}{since_col}  {r['error'][:30]}")
         else:
             lr = format_datetime(r['last_refresh'])
-            print(f"  {icon} {r['prefix']:<8} {r['count']:>10,} {lr:>22} {age:>10}{since_col}")
+            print(f"  {icon} {r['prefix']:<8} {r['count']:>10,} {lr:>22} {age:>18}{since_col}")
 
     # Summary
     total_rows = sum(r['count'] for r in results if r['exists'])
