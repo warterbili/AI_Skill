@@ -121,6 +121,7 @@ that touches an invariant, verify the fields match Phase 0's resolved table.
 | **I6** | **Exactly ONE** task per `(platform, prefix, month)` has `id_refresh=True`; all workers are `id_refresh=False` | Phase 2 id_refresh table, 5.1, 5.1b | Multiple tasks try to populate Redis → queue state clash → duplicated/missed outlets |
 | **I7** | `AWS_ACCOUNT_ID` resolved in Phase 0 ≡ account MFA authenticated to ≡ account owning ECR/ECS/Subnets | Phase 0, 3.1, 4.1, 5.1 | Cross-account references → silently resolve to nothing, task launch fails with cryptic error |
 | **I8** | MySQL finder data exists AND is fresh for the target prefix | Phase 0.6 preflight, Phase 2 Q1 default | detail's `filter()` returns 0 outlets → task exits immediately with 0 items scraped, ~$2-5 wasted on Fargate startup |
+| **I9** | Task def `ggm_app.image` MUST contain `conso_{platform}_spider` for the platform being launched (**TASK-IMAGE**) | Phase 4.2 patch step | Spider loads wrong platform's code → wrong `id_platform` → CASS 404 → crash. **Incident A7 (JSE 2026-04-14):** shared task def was overwritten by IFD CI; JSE launched IFD's spider unknowingly |
 
 **Rule of thumb:** after every AWS call, grep output for the invariant's fields
 and assert they match Phase 0. If an assertion fails, STOP and narrate — don't
@@ -835,9 +836,16 @@ echo "✅ Updated IMAGE_DIGEST = $IMAGE_DIGEST"
 
 ## Phase 4 — Prepare Fargate Task Definition
 
-**Why:** The shared task def `conso-outlet-detail` uses `ggm_app:latest`.
+**Why:** The shared task def `conso-outlet-detail` is used by ALL platforms.
+**Every CI run from any platform overwrites the image in this task def.**
 ECS `run-task` cannot override `image`. Must register a new revision — and we
 pin the image by **digest**, not by `:latest` tag (Invariant I3).
+
+> **⚠️ Incident A7 (JSE 2026-04-14):** If you skip this phase and use the task def
+> as-is, you may launch a DIFFERENT platform's spider. JSE tried to run detail but the
+> task def pointed to `conso_ifd_spider` (IFD ran CI last). Spider loaded IFD code →
+> CASS 404 for `/conso-config/IFD/UK` → crash. **Always verify the image name contains
+> `conso_{platform}_spider` before launching.** (Invariant I9: TASK-IMAGE)
 
 ### 4.1 Build image URI (digest-pinned, account-dynamic)
 
