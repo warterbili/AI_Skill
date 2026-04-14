@@ -15,7 +15,7 @@ so a complete migration doesn't require remembering 30 commands.
 | # | Skill | Purpose | Key Files |
 |--:|---|---|---|
 | 1 | [parse-workflow](parse-workflow/) | Analyze a reverse-engineered crawler, write `finder_parse.py` + `detail_parse.py` for a new food-delivery platform. Outputs `handoff.json` for the next step. | `SKILL.md`, `workflow.md`, `scripts/validate_handoff.py`, `validate_output.py` |
-| 2 | [conso-migrate](conso-migrate/) | Take any crawler (Scrapy, Postman, Bruno, JS, Go…) and migrate it to the ConSo standard — spider code, Dockerfile, CI/CD, MySQL/Redis setup. Reads `handoff.json` if present. | `SKILL.md`, 13 templates |
+| 2 | [conso-migrate](conso-migrate/) | Take any crawler (Scrapy, Postman, Bruno, JS, Go…) and migrate it to the ConSo standard — spider code, Dockerfile, CI/CD, MySQL/Redis setup. Reads `handoff.json` if present. Includes shared diagnostic scripts for finder health monitoring. | `SKILL.md`, 13 templates, `check_mysql.py`, `check_spiderkeeper.py`, `check_redis.py`, `manage_spiderkeeper.py` |
 | 3 | [grid-gen](grid-gen/) | Generate hexagonal (H3) grid points for finder spiders. Covers scope definition, S3 upload, Redis push, CASS update, and `push_grids.py` sync. Dual mode: FULL (spider project) or GENERATE-ONLY (pre-migration). | `SKILL.md`, `scripts/generate_grid.py` |
 | 4 | [conso-deploy](conso-deploy/) | Deploy a migrated ConSo project to AWS — ECR repo, GitHub Actions, CloudWatch logs, EventBridge cron rules, CASS activation. | `SKILL.md` |
 | 5 | [run-detail](run-detail/) | Trigger ad-hoc detail spider runs on Fargate. Smart entry, multi-instance, OOM auto-recovery, post-run S3/MySQL data verification. | `SKILL.md` |
@@ -89,8 +89,47 @@ is predictable and skills compose cleanly:
 | **State files** | `~/.claude/state/{skill}/{key}.json` for cross-session resume + cross-skill awareness |
 | **JSON stdout / stderr narration** | Bundled scripts emit JSON on stdout, narration on stderr — pipeable through `jq` |
 
+| **Cascading diagnostic chain** | When something looks wrong, Claude doesn't just report it — it runs a multi-layer decision tree (MySQL → SpiderKeeper → Redis), where each layer's result determines whether to run the next, and the final step is an actionable fix (not just a diagnosis) |
+
 These patterns mean that **once you're familiar with one skill, the rest feel
 identical** — same conventions, same assumptions, same rescue mechanisms.
+
+---
+
+## Shared Diagnostic Tools
+
+These scripts live in `conso-migrate/` but are used by multiple skills.
+They form a **cascading diagnostic chain** — each tool's output determines
+whether Claude runs the next:
+
+```
+Layer 0: check_mysql.py          "Is finder writing to MySQL?"
+    │
+    ├─ ✅ fresh → done (proceed silently)
+    ├─ ⚠️ stale → trigger Layer 1
+    └─ ❌ empty → trigger Layer 1
+         │
+Layer 1: check_spiderkeeper.py   "Is the finder process alive?"
+    │
+    ├─ RUNNING + stalled → trigger Layer 2
+    ├─ RUNNING + zombie → offer to stop+restart (manage_spiderkeeper.py)
+    └─ NOT RUNNING → offer to start (manage_spiderkeeper.py)
+         │
+Layer 2: check_redis.py          "Are there grids to process?"
+    │
+    ├─ key exists (ZCARD≥0) → grids OK, issue is elsewhere (proxy/API)
+    └─ key missing → grids never pushed, run push_grids.py first
+```
+
+| Script | What it checks | Used by |
+|---|---|---|
+| `check_mysql.py` | MySQL row count, last_refresh, growth in last N minutes | conso-migrate (Phase 12, 13.5), run-detail (Phase 0.6) |
+| `check_spiderkeeper.py` | SpiderKeeper RUNNING finder jobs + MySQL cross-check | conso-migrate (Phase 13.5), run-detail (Phase 0.6) |
+| `check_redis.py` | Redis grid counts via SSM → Docker exec | conso-migrate (Phase 12), run-detail (Phase 0.6) |
+| `manage_spiderkeeper.py` | Stop / start / deploy finder jobs | conso-migrate (Phase 13), run-detail (Phase 0.6 auto-fix) |
+
+All scripts are standalone (no scrapy.cfg dependency), support `--json` for
+programmatic use, and auto-discover platform configs from AWS.
 
 ---
 
