@@ -1,15 +1,30 @@
 """
-Insert or update ConSo platform config rows in the CASS PostgreSQL database.
+Query, insert, update, or activate ConSo platform config rows in the CASS PostgreSQL database.
 
 PostgreSQL credentials are read from s3://dash-dbcenter/config/conso/cass_config.json.
 
 Modes
 -----
-upsert (default)
+query (--query flag)
+    View current CASS config for a platform (all prefixes or specific ones).
+
+    python cass_insert.py --id-platform DLR --query
+    python cass_insert.py --id-platform DLR --prefixes UK,AE --query
+    python cass_insert.py --query --all                          # all platforms
+
+update (--update flag)
+    Modify specific fields for existing rows. Only specified fields are changed.
+
+    python cass_insert.py --id-platform DLR --prefixes UK,AE,BE --update \\
+        --detail-concurrent 2 --detail-delay 3.0
+    python cass_insert.py --id-platform DLR --update \\
+        --finder-concurrent 1 --finder-delay 30
+
+upsert (default, no flag)
     Insert or update config rows for the given platform + prefixes.
     --email is required in this mode.
 
-    poetry run python cass_insert.py \\
+    python cass_insert.py \\
         --id-platform DRD \\
         --prefixes US,CA \\
         --email engineer@dashmote.com \\
@@ -26,7 +41,7 @@ activate  (--activate flag)
     By default both finder and detail are activated. Use --finder-only or
     --detail-only to activate a single spider when the other is not yet ready.
 
-    poetry run python cass_insert.py \\
+    python cass_insert.py \\
         --id-platform DRD \\
         --prefixes US,CA \\
         --activate \\                  # activates both
@@ -102,79 +117,245 @@ ACTIVATE_DETAIL_SQL = """
 """
 
 
+QUERY_PLATFORM_SQL = """
+    SELECT id_platform, country_code,
+           finder_concurrent_requests, finder_delay, finder_geo_distance,
+           finder_is_active,
+           detail_concurrent_requests, detail_delay,
+           detail_is_active,
+           table_list, maintainer_email, last_refresh
+    FROM conso_config
+    WHERE id_platform = %s
+    ORDER BY country_code
+"""
+
+QUERY_PLATFORM_PREFIXES_SQL = """
+    SELECT id_platform, country_code,
+           finder_concurrent_requests, finder_delay, finder_geo_distance,
+           finder_is_active,
+           detail_concurrent_requests, detail_delay,
+           detail_is_active,
+           table_list, maintainer_email, last_refresh
+    FROM conso_config
+    WHERE id_platform = %s AND country_code = ANY(%s)
+    ORDER BY country_code
+"""
+
+QUERY_ALL_SQL = """
+    SELECT id_platform, country_code,
+           finder_concurrent_requests, finder_delay,
+           finder_is_active,
+           detail_concurrent_requests, detail_delay,
+           detail_is_active
+    FROM conso_config
+    ORDER BY id_platform, country_code
+"""
+
+
+def action_query(args, conn_string):
+    """Query CASS config for a platform or all platforms."""
+    with psycopg2.connect(conn_string) as conn:
+        if args.all:
+            df = pd.read_sql(QUERY_ALL_SQL, conn)
+        elif args.prefixes:
+            prefixes = [p.strip() for p in args.prefixes.split(',')]
+            df = pd.read_sql(QUERY_PLATFORM_PREFIXES_SQL, conn,
+                             params=(args.id_platform, prefixes))
+        else:
+            df = pd.read_sql(QUERY_PLATFORM_SQL, conn,
+                             params=(args.id_platform,))
+
+    if df.empty:
+        target = "all platforms" if args.all else args.id_platform
+        print(f"No CASS config found for {target}.")
+    else:
+        print(df.to_string(index=False))
+    return df
+
+
+def action_update(args, conn_string):
+    """Update specific fields for existing rows."""
+    # Build SET clause dynamically from provided flags
+    updates = []
+    params_base = []
+
+    if args.finder_concurrent is not None:
+        updates.append("finder_concurrent_requests = %s")
+        params_base.append(args.finder_concurrent)
+    if args.finder_delay is not None:
+        updates.append("finder_delay = %s")
+        params_base.append(args.finder_delay)
+    if args.detail_concurrent is not None:
+        updates.append("detail_concurrent_requests = %s")
+        params_base.append(args.detail_concurrent)
+    if args.detail_delay is not None:
+        updates.append("detail_delay = %s")
+        params_base.append(args.detail_delay)
+    if args.finder_geo_distance is not None:
+        updates.append("finder_geo_distance = %s")
+        params_base.append(args.finder_geo_distance)
+
+    if not updates:
+        print("❌ No fields to update. Use --detail-concurrent, --detail-delay, etc.")
+        return
+
+    updates.append("last_refresh = CURRENT_TIMESTAMP")
+    set_clause = ", ".join(updates)
+
+    if args.prefixes:
+        prefixes = [p.strip() for p in args.prefixes.split(',')]
+    else:
+        # Update all prefixes for this platform
+        with psycopg2.connect(conn_string) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT country_code FROM conso_config WHERE id_platform = %s",
+                            (args.id_platform,))
+                prefixes = [r[0] for r in cur.fetchall()]
+        if not prefixes:
+            print(f"❌ No CASS rows found for {args.id_platform}.")
+            return
+
+    sql = f"UPDATE conso_config SET {set_clause} WHERE id_platform = %s AND country_code = %s"
+
+    with psycopg2.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            for prefix in prefixes:
+                row_params = params_base + [args.id_platform, prefix]
+                cur.execute(sql, row_params)
+                print(f"  Updated {args.id_platform}/{prefix}")
+        conn.commit()
+    print(f"✅ Updated {len(prefixes)} row(s)")
+
+    # Auto-verify
+    plist = [p.strip() for p in args.prefixes.split(',')] if args.prefixes else prefixes
+    with psycopg2.connect(conn_string) as conn:
+        df = pd.read_sql(QUERY_PLATFORM_SQL, conn,
+                         params=(args.id_platform,)) if not args.prefixes else \
+             pd.read_sql(QUERY_PLATFORM_PREFIXES_SQL, conn,
+                         params=(args.id_platform, plist))
+    print()
+    print(df.to_string(index=False))
+
+
+def action_activate(args, conn_string):
+    """Set is_active fields to True."""
+    if args.finder_only:
+        sql, label = ACTIVATE_FINDER_SQL, 'finder_is_active'
+    elif args.detail_only:
+        sql, label = ACTIVATE_DETAIL_SQL, 'detail_is_active'
+    else:
+        sql, label = ACTIVATE_BOTH_SQL, 'finder_is_active + detail_is_active'
+
+    prefixes = [p.strip() for p in args.prefixes.split(',')]
+    rows = [(args.id_platform, prefix) for prefix in prefixes]
+    with psycopg2.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        conn.commit()
+    print(f"Activated [{label}] for {len(rows)} row(s): {args.id_platform} {prefixes}")
+
+    if args.verify:
+        with psycopg2.connect(conn_string) as conn:
+            df = pd.read_sql(QUERY_PLATFORM_PREFIXES_SQL, conn,
+                             params=(args.id_platform, prefixes))
+        print(df.to_string(index=False))
+
+
+def action_upsert(args, conn_string):
+    """Insert or update config rows."""
+    if not args.maintainer_email:
+        print("❌ --email is required in upsert mode")
+        return
+
+    prefixes = [p.strip() for p in args.prefixes.split(',')]
+    fc = args.finder_concurrent if args.finder_concurrent is not None else 1
+    fd = args.finder_delay if args.finder_delay is not None else 60
+    dc = args.detail_concurrent if args.detail_concurrent is not None else 16
+    dd = args.detail_delay if args.detail_delay is not None else 0.1
+    fgd = args.finder_geo_distance or ''
+
+    rows = [
+        (args.id_platform, prefix, fc, fd, fgd, dc, dd,
+         args.table_list, args.maintainer_email)
+        for prefix in prefixes
+    ]
+    with psycopg2.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(UPSERT_SQL, rows)
+        conn.commit()
+    print(f"Upserted {len(rows)} row(s) for {args.id_platform}: {prefixes}")
+
+    if args.verify:
+        with psycopg2.connect(conn_string) as conn:
+            df = pd.read_sql(QUERY_PLATFORM_PREFIXES_SQL, conn,
+                             params=(args.id_platform, prefixes))
+        print(df.to_string(index=False))
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Insert/update CASS conso_config rows.')
-    parser.add_argument('--id-platform',         required=True)
-    parser.add_argument('--prefixes',             required=True, help='Comma-separated, e.g. US,CA')
+    parser = argparse.ArgumentParser(
+        description='Query, update, insert, or activate CASS conso_config rows.')
+    parser.add_argument('--id-platform',         default=None,
+                        help='Platform ID (e.g. DLR, TKW). Required except with --query --all')
+    parser.add_argument('--prefixes',             default=None,
+                        help='Comma-separated country codes (e.g. UK,AE,BE). Omit for all prefixes.')
+
+    # Mode flags
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--query',    action='store_true', help='View current config')
+    mode.add_argument('--update',   action='store_true', help='Modify specific fields')
+    mode.add_argument('--activate', action='store_true', help='Set is_active to True')
+    # Default (no flag) = upsert
+
+    # Query options
+    parser.add_argument('--all',    action='store_true', help='With --query: show all platforms')
+    parser.add_argument('--json',   action='store_true', help='Output as JSON')
+
+    # Value flags (used by upsert and update)
     parser.add_argument('--email',                dest='maintainer_email', default=None)
     parser.add_argument('--table-list',
                         default='["outlet_information","outlet_meal","meal_option","option_relation"]')
-    parser.add_argument('--finder-concurrent',    type=int, default=1)
-    parser.add_argument('--detail-concurrent',    type=int, default=16)
-    parser.add_argument('--finder-delay',         type=float, default=60)
-    parser.add_argument('--detail-delay',         type=float, default=0.1)
-    parser.add_argument('--finder-geo-distance',  default='',
+    parser.add_argument('--finder-concurrent',    type=int, default=None)
+    parser.add_argument('--detail-concurrent',    type=int, default=None)
+    parser.add_argument('--finder-delay',         type=float, default=None)
+    parser.add_argument('--detail-delay',         type=float, default=None)
+    parser.add_argument('--finder-geo-distance',  default=None,
                         help='key_suffix from push_grids CONFIGS (e.g. 3000_grid)')
-    parser.add_argument('--activate',             action='store_true',
-                        help='Set is_active field(s) to True (default: both)')
-    parser.add_argument('--finder-only',          action='store_true',
-                        help='With --activate: set finder_is_active only')
-    parser.add_argument('--detail-only',          action='store_true',
-                        help='With --activate: set detail_is_active only')
+
+    # Activate options
+    parser.add_argument('--finder-only',          action='store_true')
+    parser.add_argument('--detail-only',          action='store_true')
     parser.add_argument('--verify',               action='store_true',
                         help='Print rows after operation')
+
     args = parser.parse_args()
 
     if args.finder_only and args.detail_only:
         parser.error("--finder-only and --detail-only are mutually exclusive")
 
-    prefixes = [p.strip() for p in args.prefixes.split(',')]
+    if not args.query and not args.all and not args.id_platform:
+        parser.error("--id-platform is required (or use --query --all)")
+
     cfg = load_pg_config()
     conn_string = get_conn_string(cfg)
 
-    if args.activate:
-        if args.finder_only:
-            sql, label = ACTIVATE_FINDER_SQL, 'finder_is_active'
-        elif args.detail_only:
-            sql, label = ACTIVATE_DETAIL_SQL, 'detail_is_active'
-        else:
-            sql, label = ACTIVATE_BOTH_SQL, 'finder_is_active + detail_is_active'
-
-        rows = [(args.id_platform, prefix) for prefix in prefixes]
-        with psycopg2.connect(conn_string) as conn:
-            with conn.cursor() as cur:
-                cur.executemany(sql, rows)
-            conn.commit()
-        print(f"Activated [{label}] for {len(rows)} row(s): {args.id_platform} {prefixes}")
-
+    if args.query:
+        df = action_query(args, conn_string)
+        if args.json and not df.empty:
+            print(df.to_json(orient='records', indent=2))
+    elif args.update:
+        if not args.id_platform:
+            parser.error("--id-platform is required for --update")
+        action_update(args, conn_string)
+    elif args.activate:
+        if not args.id_platform or not args.prefixes:
+            parser.error("--id-platform and --prefixes are required for --activate")
+        action_activate(args, conn_string)
     else:
-        if not args.maintainer_email:
-            parser.error("--email is required in upsert mode")
-
-        rows = [
-            (
-                args.id_platform, prefix,
-                args.finder_concurrent, args.finder_delay, args.finder_geo_distance,
-                args.detail_concurrent, args.detail_delay,
-                args.table_list, args.maintainer_email,
-            )
-            for prefix in prefixes
-        ]
-        with psycopg2.connect(conn_string) as conn:
-            with conn.cursor() as cur:
-                cur.executemany(UPSERT_SQL, rows)
-            conn.commit()
-        print(f"Upserted {len(rows)} row(s) for {args.id_platform}: {prefixes}")
-
-    if args.verify:
-        with psycopg2.connect(conn_string) as conn:
-            df = pd.read_sql(
-                "SELECT id_platform, country_code, finder_is_active, detail_is_active, "
-                "finder_geo_distance, maintainer_email, last_refresh "
-                f"FROM conso_config WHERE id_platform = '{args.id_platform}'",
-                conn
-            )
-        print(df.to_string())
+        # Default: upsert
+        if not args.prefixes:
+            parser.error("--prefixes is required for upsert mode")
+        action_upsert(args, conn_string)
 
 
 if __name__ == '__main__':
