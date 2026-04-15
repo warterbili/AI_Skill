@@ -7,6 +7,88 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 
 # ConSo Migration Assistant
 
+---
+
+# 🛑🛑🛑 IRON LAW — ROBOT PRINCIPLE — 100% STRICT ENFORCEMENT 🛑🛑🛑
+
+## ⚠️ READ `dashmote_sourcing` SOURCE BEFORE YOU WRITE ONE LINE OF CODE ⚠️
+
+## ⚠️ READ `dashmote_sourcing` SOURCE BEFORE YOU WRITE ONE LINE OF CODE ⚠️
+
+## ⚠️ READ `dashmote_sourcing` SOURCE BEFORE YOU WRITE ONE LINE OF CODE ⚠️
+
+**This is NOT a guideline. This is NOT a preference. This is a BLOCKING precondition.**
+**Violation of this rule is forbidden. If you have not read the framework source, you MUST NOT proceed to the next phase.**
+
+`dashmote_sourcing` is the ConSo framework. It already contains **everything** you need:
+IP rotation, TLS fingerprint spoofing, proxy auth, BrightData zone management, country
+filtering, cookie handling, cloudscraper / curl_cffi / primp / tls_client / httpx /
+niquests escape hatches, RDS / S3 / MongoDB / preprocess pipelines, spider base class,
+Redis driver, CASS client, AWS Secrets Manager integration, Prometheus metrics.
+
+**You do NOT write middleware. Ever.** If you feel you need a project-local
+`{id_platform}/middlewares.py`, it means **you have not finished reading the framework
+source**. Go back. Read it again. The capability you think is missing is already there.
+
+### Mandatory files to read cover-to-cover before Phase 8.0:
+
+```
+dashmote_sourcing/middlewares/proxy_middleware.py       # StaticProxy / DynamicProxies / BaseProxy
+dashmote_sourcing/middlewares/tlsclient_middleware.py   # TLS fingerprint rotation
+dashmote_sourcing/middlewares/monitor_middleware.py     # Prometheus
+dashmote_sourcing/middlewares/maintenance_telemetry_middleware.py
+dashmote_sourcing/extensions/request_helper.py          # escape-hatch HTTP helper (7 backends)
+dashmote_sourcing/extensions/response_helper.py
+dashmote_sourcing/extensions/request_helper.py
+dashmote_sourcing/extensions/qa_trigger.py
+dashmote_sourcing/extensions/s3_cache_extension.py
+dashmote_sourcing/pipelines/mysql_pipeline.py           # RDSPipeline
+dashmote_sourcing/pipelines/s3_pipeline.py              # S3Pipeline
+dashmote_sourcing/pipelines/preprocess_pipeline.py      # PreprocessPipeline
+dashmote_sourcing/pipelines/mongodb_pipeline.py         # MongoDBPipeline (local test)
+dashmote_sourcing/spiders/spider_template.py            # BaseSpider — filter(), load_metadata(), etc.
+dashmote_sourcing/db/mysql_client.py
+dashmote_sourcing/db/redis_client.py
+dashmote_sourcing/db/secrets_manager.py
+dashmote_sourcing/db/cass_client.py
+dashmote_sourcing/db/google_client.py
+dashmote_sourcing/middlewares/__init__.py               # see exactly what's exported
+dashmote_sourcing/extensions/__init__.py                # see exactly what's exported
+dashmote_sourcing/pipelines/__init__.py
+```
+
+Output a short internal summary of every class + its public spider-attrs (like
+`proxy_use_static`, `proxy_country_filter`, `proxy_use_residential`, `max_retry_times`,
+`change_ip_status_codes`, `ignore_status_codes`) — those are the knobs you flip.
+You DO NOT subclass or wrap these middlewares. You FLIP THEIR ATTRIBUTES.
+
+### Consequences of skipping this step (observed)
+
+Session 2026-04-16 — skipped the source review, walked 4 wrong paths:
+1. Misread `StaticProxyMiddleware` as "sticky IP until 403" → it's actually `random.choice(ip_list)` per request.
+2. Proposed swapping to `DynamicProxiesMiddleware` "for rotation" → rotation was already there.
+3. `DynamicProxies + TlsClient` crashed → misdiagnosed as "framework bug" (it wasn't; the combo wasn't designed to mix — framework provides `RequestHelper` for Dynamic+TLS scenarios).
+4. About to roll back to a project-local middleware → user caught it. Had I read `proxy_middleware.py:142-148` (zone switching logic) beforehand, the answer `proxy_use_static=True + proxy_country_filter=True` would have taken 30 seconds instead of a 4-hour detour.
+
+See Appendix A6 for the full post-mortem.
+
+### The three commands you MUST run before Phase 8.0
+
+```bash
+# 1. List every middleware class in the framework
+grep -rn "^class" $(python -c "import dashmote_sourcing; print(dashmote_sourcing.__path__[0])")/middlewares
+
+# 2. List every extension class
+grep -rn "^class" $(python -c "import dashmote_sourcing; print(dashmote_sourcing.__path__[0])")/extensions
+
+# 3. List every spider-attribute knob the framework reads
+grep -rnE "getattr\(spider, ['\"][a-z_]+['\"]" $(python -c "import dashmote_sourcing; print(dashmote_sourcing.__path__[0])")
+```
+
+If you cannot produce a 1-paragraph summary of what these returns, **you are not ready for Phase 8**. Stop, read more, try again.
+
+---
+
 Migrate ANY kind of crawler/scraper to ConSo standard end-to-end with maximum automation.
 The source may be a Scrapy project, a requests script, a Jupyter notebook, a Postman
 collection, a Bruno file, a crawler written in JavaScript/Go/Java/Ruby — or any combination.
@@ -129,8 +211,22 @@ silently if Phase B doesn't hold up its end. Check these proactively, not reacti
 | I4 | `PreprocessPipeline` enabled ⟹ QA validation sheet exists | Phase 9 | Phase 12.0 Gate G4 | `FileNotFoundError` on detail spider start |
 | I5 | ECR image commit ≥ last working-tree commit | Phase 15 | Phase 12.0 Gate G3 | Fargate runs stale code |
 | I6 | HTTP is via `yield scrapy.Request` (Hard Rule R1) | Phase 8.1 / 9 | Phase 12 Step 1 check `Crawled N pages > 0` | `Crawled 0 pages` while items grow (YDE finder 60h) |
+| I7 | **Project-local middleware = 100% WRONG. Iron Law (top of this skill).** If you think you need one, you have not finished reading the framework source. Stop, read `dashmote_sourcing/middlewares/*.py` + `extensions/*.py` cover-to-cover, then try again — the capability is already there (spider-attr knob, zone flag, or `RequestHelper` escape hatch). | Phase 8.1 / 9 | Phase 12.5 Gate G6 (grep for non-`dashmote_sourcing` middleware paths) | YDE 2026-04-16: 4 wrong paths in one session from misreading `StaticProxyMiddleware` (see A6) |
 
 If a downstream Gate fails, the upstream phase did something wrong — **fix the source**, don't patch around it.
+
+**I7 in plain English:** every entry in a spider's `custom_settings['DOWNLOADER_MIDDLEWARES']`
+and `custom_settings['ITEM_PIPELINES']` MUST begin with `dashmote_sourcing.` or be a
+disable (`None`) of a Scrapy built-in. **Writing `{id_platform}/middlewares.py` is
+forbidden** — it's the Iron Law at the top of this skill. The framework already ships
+IP rotation (`StaticProxyMiddleware` with `random.choice(ip_list)` per request +
+auto-ban + cool-down, `DynamicProxiesMiddleware` for residential / web_unlocker),
+TLS fingerprint spoofing (`TlsClientDownloaderMiddleware` — 46+ browser profiles),
+BrightData zone switching (`proxy_use_static` / `proxy_use_residential` spider attrs),
+country filtering (`proxy_country_filter=True` + prefix), escape-hatch direct HTTP
+(`RequestHelper.fetch()` in `extensions/request_helper.py` — 7 backends incl.
+cloudscraper / curl_cffi / primp / tls_client / httpx / niquests), Prometheus metrics,
+all pipelines. **If the capability looks missing, you haven't read the source.**
 
 ---
 
@@ -296,7 +392,7 @@ done
 | TKW (Thuisbezorgd, EU) | TLS fingerprint | `TlsClientDownloaderMiddleware` @ 301 + `StaticProxy` |
 | DLR (Deliveroo, ME/EU) | TLS fingerprint | `TlsClientDownloaderMiddleware` + `MixProxiesMiddleware` |
 | JSE (Just Eat, EU) | Mild | `StaticProxy` only |
-| YDE (Yandex, RU) | TLS fingerprint (Yandex blocks non-browser TLS) | project-local `CurlCffiImpersonateMiddleware` @ 800 |
+| YDE (Yandex, RU) | TLS fingerprint + datacenter-IP block (Yandex blocks non-browser TLS at connection layer) | framework `StaticProxyMiddleware` @ 300 + `TlsClientDownloaderMiddleware` @ 301, disable `HttpCompressionMiddleware` + `RetryMiddleware`; **spider attrs** `proxy_use_static = True` + `proxy_country_filter = True`; Request `meta['use_tls_middleware'] = True`. Verified 2026-04-16: 5-min RU local test = 1060 pages / 205k items / 13 errors. See A6. |
 
 **Decision rule**: if the new platform's reverse-engineering shape matches a
 peer, copy that peer's middleware setup. Deviate only with a written rationale.
@@ -946,21 +1042,40 @@ flow and instead go through `scraper.start_itemproc(item, response=None)`. The
 container silently drops items on this path — no exceptions, no warnings, just
 zero MySQL writes while Scrapy's `scraped_count` keeps ticking up.
 
-**TLS fingerprint spoofing** (for platforms that block the default Scrapy TLS
-fingerprint — Yandex Eats, iFood, DoorDash, etc.): use the `scrapy-impersonate`
-download handler (already wired in the generated `settings.py` from Phase 5.3).
+**TLS fingerprint spoofing — framework middleware only (Invariant I7).**
+For platforms that block the default Scrapy TLS fingerprint (Yandex Eats,
+Deliveroo, Thuisbezorgd, iFood, DoorDash, etc.), use the framework's
+`TlsClientDownloaderMiddleware` (uses `tls_client` under the hood; scrapyd
+container already has it). **Do NOT wrap `curl_cffi` / `tls_client` in a
+project-local middleware** — the previous YDE `CurlCffiImpersonateMiddleware`
+pattern was deprecated 2026-04-15; it drifts from the framework API every time
+`dashmote_sourcing` is updated and causes silent bugs.
+
+Wire it in `custom_settings` (DLR-aligned pattern):
 
 ```python
-# In the spider class:
-IMPERSONATE = 'chrome110'    # curl_cffi profile; pick closest to what the source used
+custom_settings = {
+    "DOWNLOADER_MIDDLEWARES": {
+        'dashmote_sourcing.middlewares.proxy_middleware.StaticProxyMiddleware': 300,
+        'dashmote_sourcing.middlewares.tlsclient_middleware.TlsClientDownloaderMiddleware': 301,
+        'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 543,
+        # TlsClientDownloaderMiddleware handles retries + decompression itself.
+        'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': None,
+        'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
+    },
+    ...
+}
+```
 
-# In start_requests / a callback:
+Activate per-Request via `meta['use_tls_middleware'] = True`:
+
+```python
 yield scrapy.Request(
     url=...,
     method="POST",
     body=json.dumps(payload),
     headers={
-        "User-Agent": "Mozilla/5.0 ... Chrome/110.0.0.0 Safari/537.36",  # always include!
+        "User-Agent": "Mozilla/5.0 ... Chrome/110.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en,…",
         "Content-Type": "application/json",
@@ -969,14 +1084,27 @@ yield scrapy.Request(
         # platform-specific headers
     },
     callback=self.parse_grid,
-    meta={"impersonate": self.IMPERSONATE, "grid": grid},
+    meta={"use_tls_middleware": True, "grid": grid},
 )
 ```
 
-Header note: `scrapy-impersonate` does NOT auto-inject a browser User-Agent —
-Scrapy's default `UserAgentMiddleware` will insert `Scrapy/2.x.x` unless you
-override. **Always set `User-Agent` matching the impersonate profile in your
-request headers**, otherwise the target will 403 you even with chrome110 TLS.
+Notes:
+- `TlsClientDownloaderMiddleware` rotates its client identifier on every request
+  (46+ browser profiles). You do NOT pick a specific profile like `chrome110`.
+  If a platform specifically requires one profile, that's a platform bug report
+  against the framework — don't work around it with a project-local middleware.
+- Requests whose `meta` lacks `use_tls_middleware=True` fall through to the
+  default Scrapy downloader (so finder stats / health endpoints can bypass TLS).
+- **Always set `User-Agent`** in your request headers — neither `tls_client` nor
+  the framework middleware auto-injects one; Scrapy's default would insert
+  `Scrapy/2.x.x` and most targets 403 on that.
+
+**When `TlsClientDownloaderMiddleware` is not enough** (rare — would require
+the platform to detect `tls_client`'s specific fingerprint): do NOT write a
+project-local middleware. Instead: (1) file an issue against `dashmote_sourcing`,
+(2) extend the framework middleware there so every platform benefits, (3) bump
+the framework dependency and redeploy. Creating a new project-local middleware
+is explicit Invariant I7 violation — ask the user before doing so.
 
 **Adaptation by source type — every source maps to the classic Request path:**
 
@@ -984,7 +1112,7 @@ request headers**, otherwise the target will 403 you even with chrome110 TLS.
 |---|---|
 | **Scrapy spider** | Port `start_requests` / `parse` directly into the template (already classic path). |
 | **`requests` / `httpx` script** | Each `session.get/post(...)` becomes a `yield scrapy.Request(url, callback=self.parse_xxx, meta={...})`. The callback receives the response. Session cookies are auto-handled by Scrapy's `CookiesMiddleware`. |
-| **`curl_cffi` / `tls_client` with impersonation** | Same as above + set `self.IMPERSONATE = '<profile>'` and include `meta['impersonate']=self.IMPERSONATE`. This routes the Request through `scrapy-impersonate` which uses curl_cffi under the hood — same TLS fingerprint, but now inside Scrapy's Downloader. |
+| **`curl_cffi` / `tls_client` with impersonation** | Same as above + add `meta['use_tls_middleware'] = True` to every yielded Request AND wire framework `TlsClientDownloaderMiddleware` @ 301 + `StaticProxyMiddleware` @ 300 in `custom_settings['DOWNLOADER_MIDDLEWARES']` (see TLS block above). **Do NOT write a project-local `curl_cffi` / `tls_client` middleware — this violates Invariant I7.** The source project probably picked `curl_cffi` specifically; that choice does not carry over — ConSo uses `tls_client` via the framework. |
 | **Selenium / Playwright / nodriver** | Use `scrapy-playwright`; yield `scrapy.Request(url, meta={"playwright": True, "playwright_page_methods": [...]})`. |
 | **Notebook / ad-hoc script** | Extract only the discovery loop logic; drop manual Redis init, session setup, logging config — BaseSpider handles those. Wrap each HTTP call as a Request yield. |
 | **Postman `.postman_collection.json`** | Parse the JSON, extract URL template / method / headers / body / auth for each discovery request. Reconstruct as `scrapy.Request(...)` calls in `start_requests`. Port OAuth / API-key pre-request scripts as instance helper methods on the spider. |
@@ -1063,9 +1191,13 @@ Remove `test=True` before deploying to production.
 - [ ] Invariant I6 satisfied: all HTTP goes through `yield scrapy.Request`;
       verify by reading the finder — no `requests.get` / `httpx` / `curl_cffi.Session`
       calls inside any spider method, no `yield FeedItem(...)` inside `start_requests`.
-- [ ] If platform needs TLS impersonation: `self.IMPERSONATE` set AND either
-      `scrapy-impersonate` confirmed in scrapyd (Phase 11.5 baseline) or a
-      project-local DownloaderMiddleware wraps `curl_cffi`/`tls_client`.
+- [ ] Invariant I7 satisfied: every entry in `custom_settings['DOWNLOADER_MIDDLEWARES']`
+      and `custom_settings['ITEM_PIPELINES']` begins with `dashmote_sourcing.` (or is a
+      `None` disable of a Scrapy built-in). No `{id_platform}.middlewares.*` entries.
+- [ ] If platform needs TLS impersonation: framework `TlsClientDownloaderMiddleware` @ 301
+      wired in DOWNLOADER_MIDDLEWARES AND every yielded Request sets
+      `meta['use_tls_middleware'] = True`. (NOT `meta['impersonate']`, NOT project-local
+      `curl_cffi`/`tls_client` wrapper — see Invariant I7.)
 
 ---
 
@@ -1097,9 +1229,10 @@ def start_requests(self):
         id_outlet = self.redis_client.pop_from_set(self.db_key)
         if not self.get_metadata(id_outlet):
             continue
+        # USE_TLS: True if this platform needs TLS impersonation (class-level constant).
         meta = {"id_outlet": id_outlet}
-        if self.IMPERSONATE:
-            meta['impersonate'] = self.IMPERSONATE
+        if self.USE_TLS:
+            meta['use_tls_middleware'] = True
         yield scrapy.Request(catalog_url, callback=self.parse_catalog, meta=meta)
 
 def parse_catalog(self, response):
@@ -1107,8 +1240,8 @@ def parse_catalog(self, response):
     yield OutletItem(...)   # item goes to S3Pipeline
     # Chain the next request; pass state via meta
     meta = {"id_outlet": id_outlet}
-    if self.IMPERSONATE:
-        meta['impersonate'] = self.IMPERSONATE
+    if self.USE_TLS:
+        meta['use_tls_middleware'] = True
     yield scrapy.Request(menu_url, callback=self.parse_menu, meta=meta)
 
 def parse_menu(self, response):
@@ -1122,7 +1255,7 @@ def parse_menu(self, response):
 |---|---|
 | **Scrapy spider** | Port request chains + parse callbacks directly. |
 | **`requests` / `httpx` script** | Each `session.get/post()` → `yield scrapy.Request(...)`; chain multi-step flows through callbacks + `meta`. |
-| **`curl_cffi` / `tls_client` with impersonation** | Same as above + set `self.IMPERSONATE = '<profile>'` and add `meta['impersonate'] = self.IMPERSONATE` to every yielded Request. |
+| **`curl_cffi` / `tls_client` with impersonation** | Same as above + wire framework `TlsClientDownloaderMiddleware` @ 301 + `StaticProxyMiddleware` @ 300 in `custom_settings['DOWNLOADER_MIDDLEWARES']` AND add `meta['use_tls_middleware'] = True` to every yielded Request. **No project-local curl_cffi / tls_client middleware** (Invariant I7). |
 | **Selenium / Playwright / nodriver** | `scrapy-playwright`; `meta={"playwright": True, "playwright_page_methods": [...]}`. |
 | **Notebook / ad-hoc script** | Extract per-outlet request/parse logic into `start_requests` + `parse_xxx` callbacks; the outer per-outlet loop is replaced by Redis queue popping. |
 | **Postman / Bruno / HAR / curl** | Parse the source format, reconstruct each request as `scrapy.Request`; chain multi-step flows as callbacks. |
@@ -1133,7 +1266,7 @@ def parse_menu(self, response):
 - `self.get_metadata(id_outlet)` replaces manual DB/file lookups
 - Remove all manual S3/MySQL write logic — `PREPROCESS_PIPELINE` + `S3_PIPELINE` handle it
 - Remove manual proxy setup — `STATIC_PROXY_MIDDLEWARE` / `DYNAMIC_PROXY_MIDDLEWARE` handle it
-- For TLS impersonation see Phase 8.1; the same `self.IMPERSONATE` + `meta['impersonate']` pattern applies
+- For TLS impersonation see Phase 8.1; framework `TlsClientDownloaderMiddleware` @ 301 + `meta['use_tls_middleware']=True` on each Request. No project-local middleware (Invariant I7).
 
 **Request/parse methods must live inside the spider class:**
 All helper methods (`_build_request`, `_get_token`, `_sign`, `parse_meals`, etc.)
@@ -1363,8 +1496,8 @@ Grep `PROBE>` from the log and capture:
 
 ## Key packages
 - dashmote_sourcing==X.Y.Z
-- curl_cffi==A.B.C            (use for TLS impersonation, scrapy-impersonate NOT installed)
-- tls-client==D.E.F            (alternative TLS library, TKW/DLR pattern)
+- tls-client==D.E.F            (ConSo standard TLS library; used by framework TlsClientDownloaderMiddleware)
+- curl_cffi==A.B.C             (present in container but NOT used directly — no project-local wrappers per Invariant I7)
 
 ## RDSPipeline key lines
 - L21: self.item_tablename = ['outlet_feeds']   ← tablename FILTER
@@ -1374,7 +1507,7 @@ Grep `PROBE>` from the log and capture:
 ## Verdict
 - FeedItem.tablename MUST be 'outlet_feeds' (confirmed by L21 filter list)
 - settings.py MUST have `DB = PLATFORM` (confirmed by L24 no-fallback)
-- For TLS: use curl_cffi via project-local middleware (scrapy-impersonate absent)
+- For TLS: use framework `TlsClientDownloaderMiddleware` (ships with dashmote_sourcing, uses tls_client). Do NOT use scrapy-impersonate (absent) or project-local curl_cffi (violates I7).
 ```
 
 This file feeds Gate G2 and G5 in Phase 12.0.
@@ -1670,6 +1803,7 @@ Cross-phase Invariants at the top of this skill.
 | **G3** | I5: no uncommitted changes AND ECR image newer than last commit | `git status -s` empty AND `aws ecr describe-images ...` vs `git log -1 --format=%cI` | `git add/commit/push`, wait for platform.yml build |
 | **G4** | I4: QA validation sheet exists, OR PreprocessPipeline commented | `poetry run python -c "from dashmote_sourcing.db import GoogleClient; GoogleClient.from_config({'id_platform':'{id_platform}','country':'{first_prefix}','table_list':['outlet_information','outlet_meal','meal_option','option_relation']})"` | If the probe raises `FileNotFoundError`: either contact Q&A to create `{ID_PLATFORM}_{prefix}` sheet, OR comment out `PreprocessPipeline` in detail (leaves a TODO before production) |
 | **G5** | Production pipeline state: MongoDBPipeline disabled, MYSQL_ITEM_SIZE not set small | `grep -n "MongoDBPipeline\|MYSQL_ITEM_SIZE" {id_platform}/spiders/*.py {id_platform}/settings.py` | Every `MongoDBPipeline` line must start with `# `; `MYSQL_ITEM_SIZE` must not be in settings.py (if present, must be ≥ 1000) |
+| **G6** | I7: all middlewares & pipelines are `dashmote_sourcing.*` — no project-local wrappers | `grep -nE "^\s*'{id_platform}\.middlewares\." {id_platform}/spiders/*.py` must return nothing; `ls {id_platform}/middlewares.py 2>/dev/null` should not exist | Rewrite the offending `custom_settings` block to use framework middlewares. If you genuinely need custom logic, propose an upstream PR to `dashmote_sourcing` rather than a project-local middleware (Invariant I7 + Appendix A4). |
 
 **Do not negotiate these gates.** Skipping any one of them has cost the team days
 of silent data loss in past incidents. See Appendix A for the specific incidents
@@ -1823,7 +1957,7 @@ Four root causes, each responsible for past "0 write" incidents:
 |---|---|---|---|
 | 1 | `db_name=None` at runtime → connects to empty DB | `grep -n "^DB\s*=" {id_platform}/settings.py` | Add `DB = PLATFORM` in settings.py. scrapyd's RDSPipeline has NO fallback — omit this line and every write silently fails. (YDE/LMN 2026-04-13, 13+ days of data loss) |
 | 2 | `Crawled 0 pages` but `scraped N items` rising | Grep SpiderKeeper log for `Crawled [0-9]+ pages` | Spider is bypassing Scrapy Downloader (Hard Rule R1/R2 violation). Port all sync HTTP to `yield scrapy.Request + callback`. (YDE original, 60h loss) |
-| 3 | `Ignoring response <403>` repeating | Grep SpiderKeeper log | TLS fingerprint or User-Agent wrong. Set `self.IMPERSONATE = 'chrome110'`, add `meta['impersonate']=self.IMPERSONATE` on every Request, and put a matching browser UA in headers. |
+| 3 | `Ignoring response <403>` repeating | Grep SpiderKeeper log | TLS fingerprint or User-Agent wrong. Wire framework `TlsClientDownloaderMiddleware` @ 301 + `StaticProxyMiddleware` @ 300 in `custom_settings['DOWNLOADER_MIDDLEWARES']`; add `meta['use_tls_middleware']=True` on every Request; put a matching browser UA in headers. (NOT `meta['impersonate']`, NOT a project-local curl_cffi middleware — see Invariant I7 / Appendix A4.) |
 | 4 | `tablename` filter mismatch | Run diagnostic spider (see below) to see the running `RDSPipeline` source | Check `self.item_tablename` line; set `FeedItem.tablename` to match. Working peers: IFD/TKW/JSE/DLR. |
 
 **Diagnostic spider** — drop this into `{id_platform}/spiders/diagnostic.py`,
@@ -2094,11 +2228,20 @@ post-deploy monitoring, find the match here first.
 - **Root cause**: `PreprocessPipeline.__init__` fetches Google Drive validation sheet; missing for new platforms.
 - **Prevention**: Phase 12.5 Gate **G4**. Temporary workaround: comment `PreprocessPipeline` in detail's `ITEM_PIPELINES`; production fix: contact Q&A team to create the sheet.
 
-### A4. YDE 2026-04-13 — `scrapy-impersonate` not in scrapyd container
+### A4. YDE 2026-04-13 → 2026-04-15 — `scrapy-impersonate` not in scrapyd container; project-local curl_cffi middleware deprecated
 
 - **Symptom**: SpiderKeeper log: `ModuleNotFoundError: No module named 'scrapy_impersonate'`.
 - **Root cause**: `.egg` uploads carry project code only, not pip dependencies. The scrapyd container's frozen environment has `curl_cffi` + `tls_client` but NOT `scrapy-impersonate`.
-- **Prevention**: Phase 11.5 DiagnosticSpider dumps installed packages before any real deploy. For TLS impersonation in scrapyd, use a project-local `DownloaderMiddleware` wrapping `curl_cffi` (pattern used by YDE; similar to TKW's `TlsClientDownloaderMiddleware`).
+- **Original workaround (2026-04-13, deprecated)**: project-local `CurlCffiImpersonateMiddleware` @ 800 wrapping `curl_cffi`. This shipped for two days before being replaced.
+- **Why deprecated (2026-04-15)**: violates **Invariant I7** — project-local middlewares drift from the framework API, require separate maintenance across N platforms, duplicate proxy-auth / decompression / semaphore logic that already exists in `dashmote_sourcing`, and break silently whenever the framework is updated. DLR / TKW were already using the framework `TlsClientDownloaderMiddleware` successfully against comparable TLS-fingerprinted targets; YDE's choice of `curl_cffi` was carried over from the source project, not a requirement of Yandex.
+- **Current prevention (2026-04-16 final)**:
+  1. Wire framework `StaticProxyMiddleware` @ 300 + `TlsClientDownloaderMiddleware` @ 301; disable Scrapy's `HttpCompressionMiddleware` + `RetryMiddleware` (TlsClient handles both).
+  2. For Yandex-class platforms (datacenter IPs blocked at network layer), set on the spider class: **`proxy_use_static = True`** (BrightData `static` zone — higher-quality IPs than `unlimited_proxy` default) + **`proxy_country_filter = True`** (BrightData API appends `&country={prefix}` → returns N geotagged IPs for the target country). These two attrs flip `StaticProxyMiddleware` from its default `unlimited_proxy` no-country-filter mode to the working mode.
+  3. Activate per-Request with `meta['use_tls_middleware'] = True`.
+  4. Do NOT use `scrapy-impersonate` (not in scrapyd container) and do NOT install/use `curl_cffi` directly either — neither is the ConSo standard.
+  5. Phase 12.5 Gate G6 enforces "no project-local middlewares".
+  6. If `tls_client` + static+country still fails: do NOT write a project-local middleware. Use `dashmote_sourcing.extensions.RequestHelper.fetch(use_curl_cffi=True, ...)` inside a parse callback — the framework's 7-backend escape hatch that reuses your proxy + metrics config.
+  7. YDE 2026-04-16 verified: `proxy_use_static + proxy_country_filter` → 1060 pages / 205k items / 13 errors in a 5-min local RU test. See A6.
 
 ### A5. Pipeline / middleware **full path vs short path** trap
 
@@ -2115,6 +2258,35 @@ post-deploy monitoring, find the match here first.
   | StaticProxyMiddleware | `dashmote_sourcing.middlewares.proxy_middleware.StaticProxyMiddleware` |
   | DynamicProxiesMiddleware | `dashmote_sourcing.middlewares.proxy_middleware.DynamicProxiesMiddleware` |
 
+### A6. YDE 2026-04-16 — 4 wrong paths in one session from not reading framework source
+
+- **Symptom**: Trying to replace `CurlCffiImpersonateMiddleware` (project-local), chained misdiagnoses:
+  1. After first swap to framework `StaticProxyMiddleware + TlsClientDownloaderMiddleware` with defaults, 5-min RU test had only 70 pages / 2406 items and 73 network-layer errors (`unexpected EOF` / `Client.Timeout`). **Misread**: claimed "StaticProxyMiddleware keeps the same IP until 403, not per-request" — **wrong**, `process_request` does `random.choice(ip_list)`.
+  2. Based on that misread, proposed swapping to `DynamicProxiesMiddleware` for "per-request rotation" — the rotation was already there.
+  3. `DynamicProxiesMiddleware + TlsClientDownloaderMiddleware` crashed 100% of requests with `ValueError: not enough values to unpack (expected 2, got 1)` in `TlsClient.convert_proxy` (it expects `-ip-{IP}` in auth, which Dynamic's auth lacks). **Misdiagnosed** as "framework bug" — it isn't; these two were never designed to be combined.
+  4. About to revert to project-local `CurlCffiImpersonateMiddleware`. User caught it: "*dashmote-sourcing 提供 ip 轮换代理的东西，你肯定是没好好看*".
+- **Root cause**: Skipped reading `proxy_middleware.py` cover-to-cover before proposing architecture. Had I read lines 142-156 (zone selection + `random.choice(ip_list)`) and 213-236 (`get_ip_list()` BrightData API with `&country=` support), the answer would have been immediate: two spider attrs `proxy_use_static = True` + `proxy_country_filter = True`. Had I also read `extensions/request_helper.py`, the "Dynamic+TLS" combo scenario maps to `RequestHelper.fetch(use_tls_client=True, use_curl_cffi=True)`, not middleware mixing.
+- **Correct fix (verified 2026-04-16)**:
+  ```python
+  class ConSoOutletDetail(BaseSpider):
+      proxy_use_static = True          # BrightData static zone (premium IPs, not unlimited_proxy)
+      proxy_country_filter = True      # prefix → BrightData API &country=RU → 90 RU-geotagged IPs
+      custom_settings = {
+          "DOWNLOADER_MIDDLEWARES": {
+              'dashmote_sourcing.middlewares.proxy_middleware.StaticProxyMiddleware': 300,
+              'dashmote_sourcing.middlewares.tlsclient_middleware.TlsClientDownloaderMiddleware': 301,
+              'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 543,
+              'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': None,
+              'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
+          },
+          ...,
+      }
+  # every Request: meta={'use_tls_middleware': True, ...}
+  ```
+  5-min RU test: 1060 pages / 205,133 items / 13 network errors / all 4 tables clean-flushed to S3. **77x items vs. pre-fix, 5.6x fewer errors.**
+- **Prevention (codified as top-of-skill Iron Law + Invariant I7)**:
+  Before Phase 8.0, run `grep -rn "^class" $(python -c "import dashmote_sourcing; print(dashmote_sourcing.__path__[0])")` and read every middleware + extension source file cover-to-cover. Do **not** propose any middleware architecture change before you can list every `getattr(spider, '...')` spider-attr knob the framework reads. This YDE session took ~4 hours of detours; reading `proxy_middleware.py` + `request_helper.py` end-to-end takes ~15 minutes.
+
 ---
 
 ## Appendix B — Failure Pattern Index (symptom → lookup)
@@ -2126,12 +2298,12 @@ Scan this table when anything looks wrong. Faster than re-deriving the diagnosis
 | `Crawled 0 pages` while `scraped N items` rising | Hard Rule R1 violated — sync HTTP inside spider method bypassing Scrapy Downloader | Phase 8.1 R1 + A2 |
 | `scraped N items` but MySQL row count flat, no errors | `DB = PLATFORM` missing OR `FeedItem.tablename` doesn't match scrapyd filter | Phase 12.5 G1/G2 + A1 |
 | Finder log has NO `Inserted/Updated` after 15 min | Same as above | Same |
-| `Ignoring response <403>` repeating | TLS fingerprint or User-Agent blocked | Phase 8.1 IMPERSONATE |
+| `Ignoring response <403>` repeating | TLS fingerprint or User-Agent blocked | Phase 8.1 TLS block — wire framework `TlsClientDownloaderMiddleware` + `meta['use_tls_middleware']=True` + matching browser User-Agent |
 | Detail spider exits with `FileNotFoundError: Validation file` | `PreprocessPipeline` QA sheet missing | Phase 12.5 G4 + A3 |
-| `ModuleNotFoundError: No module named 'scrapy_impersonate'` | Dependency missing from scrapyd container | A4, use project-local curl_cffi middleware |
+| `ModuleNotFoundError: No module named 'scrapy_impersonate'` | Dependency missing from scrapyd container | A4 — remove `scrapy-impersonate` entirely; use framework `TlsClientDownloaderMiddleware` instead (never install scrapy-impersonate, never write project-local curl_cffi middleware) |
 | `exitCode=137` on Fargate | Container OOM | `/run-detail` Phase 5.3b auto-recover |
 | `'bool' object has no attribute 'get'` on `filter()` | Stale ECR image (framework API changed) | Phase 12.5 G3, rebuild image |
-| Uncompressed body / double-decompression errors | TLS middleware not stripping `Content-Encoding` | YDE `CurlCffiImpersonateMiddleware` pattern |
+| Uncompressed body / double-decompression errors | Framework `TlsClientDownloaderMiddleware` conflicting with Scrapy's `HttpCompressionMiddleware` | Disable `HttpCompressionMiddleware` by setting it to `None` in `DOWNLOADER_MIDDLEWARES` — see DLR / YDE post-2026-04-15 pattern |
 | Finder MySQL writes fine, detail S3 path empty at `sourcing/YDE/` | You ran with `sample>0` → check `sourcing/sample/YDE/` instead | Phase 12 Step 2 |
 | `NameError` / `ImportError` on a pipeline class in SpiderKeeper but local works | Short-path import; scrapyd's older `dashmote_sourcing` doesn't re-export | A5, switch to full module path |
 

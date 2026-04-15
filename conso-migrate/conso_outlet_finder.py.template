@@ -13,11 +13,16 @@
 #   4. All HTTP goes through `yield scrapy.Request(...)`. The response lands in
 #      a callback; items are yielded from the callback.
 #
-# For TLS fingerprint spoofing, add meta['impersonate'] = '<browser_profile>':
-#   - scrapy-impersonate is wired as the DOWNLOAD_HANDLER in settings.py.
-#   - curl_cffi profiles: 'chrome99', 'chrome100', ..., 'chrome120', 'safari15_5', etc.
-#   - When meta['impersonate'] is set, Scrapy's Downloader routes the request
-#     through curl_cffi with the named browser fingerprint; otherwise default.
+# For TLS fingerprint spoofing, use the framework's TlsClientDownloaderMiddleware
+# (ConSo standard — Invariant I7). Activate per-Request with
+# meta['use_tls_middleware'] = True. The middleware rotates 46+ browser TLS
+# identifiers automatically — you do NOT pick a specific profile.
+#
+# DO NOT:
+#   - install scrapy-impersonate  (not in scrapyd container, breaks on deploy)
+#   - use curl_cffi directly      (violates Invariant I7 — no project-local wrappers)
+#   - write {id_platform}/middlewares.py for TLS / proxy logic — extend
+#     dashmote_sourcing upstream instead.
 #
 # Why this matters: items yielded directly from start_requests go through a rare
 # `scraper.start_itemproc(item, response=None)` path that older dashmote_sourcing
@@ -37,10 +42,12 @@ class ConSoOutletFinder(BaseSpider):
     name = "conso_outlet_finder"
     id_platform = PLATFORM
 
-    # If the platform needs TLS fingerprint spoofing, set this to the curl_cffi
-    # profile (e.g. 'chrome110', 'chrome120'). If not needed, leave as None —
-    # meta['impersonate'] will be omitted and Scrapy uses its default HTTPS handler.
-    IMPERSONATE = None   # e.g. 'chrome110' — set only if the target API blocks default Scrapy fingerprint
+    # Set True if the platform blocks default Scrapy TLS fingerprint (Yandex,
+    # Deliveroo, Thuisbezorgd, iFood, DoorDash, etc.). The framework
+    # TlsClientDownloaderMiddleware below activates per-Request via
+    # meta['use_tls_middleware']=True. Leave False for platforms that work with
+    # the default handler.
+    USE_TLS = False
 
     custom_settings = {
         "DUPEFILTER_CLASS": "scrapy.dupefilters.BaseDupeFilter",
@@ -49,7 +56,15 @@ class ConSoOutletFinder(BaseSpider):
             # 'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 300,  # for testing — enable alongside RDSPipeline, NOT instead of it
         },
         "DOWNLOADER_MIDDLEWARES": {
-            'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 100,
+            # ConSo standard stack — all framework classes (Invariant I7).
+            # Uncomment StaticProxyMiddleware + TlsClientDownloaderMiddleware if USE_TLS = True
+            # or the platform needs proxying. See DLR / TKW / YDE for reference configurations.
+            # 'dashmote_sourcing.middlewares.proxy_middleware.StaticProxyMiddleware': 300,
+            # 'dashmote_sourcing.middlewares.tlsclient_middleware.TlsClientDownloaderMiddleware': 301,
+            'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 543,
+            # Disable these when TlsClientDownloaderMiddleware is enabled (it handles them itself):
+            # 'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': None,
+            # 'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
         },
         # Throttling — adjust per platform tolerance; CASS values override these at runtime.
         "CONCURRENT_REQUESTS": 8,
@@ -107,10 +122,12 @@ class ConSoOutletFinder(BaseSpider):
             # [PORT YOUR REQUEST LOGIC HERE]
             # Use grid fields (e.g. grid['lat'], grid['lon']) to construct the API call.
             # If the original project used curl_cffi/tls_client/requests with impersonation,
-            # map that to meta['impersonate'] here (requires scrapy-impersonate handler).
+            # set USE_TLS = True (class attr above) + enable TlsClientDownloaderMiddleware
+            # in custom_settings. meta['use_tls_middleware']=True routes this request
+            # through the framework TLS middleware.
             meta = {'grid': grid}
-            if self.IMPERSONATE:
-                meta['impersonate'] = self.IMPERSONATE
+            if self.USE_TLS:
+                meta['use_tls_middleware'] = True
             yield scrapy.Request(
                 url=...,
                 callback=self.parse,

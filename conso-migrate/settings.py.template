@@ -63,10 +63,7 @@ REQUEST_FINGERPRINTER_IMPLEMENTATION = '2.7'
 TWISTED_REACTOR = 'twisted.internet.asyncioreactor.AsyncioSelectorReactor'
 FEED_EXPORT_ENCODING = 'utf-8'
 
-# Route scrapy.Request through scrapy-impersonate (curl_cffi under the hood) when
-# the spider sets meta['impersonate'] = '<browser_profile>' (e.g. 'chrome110').
-# Without meta['impersonate'], Scrapy uses its default HTTPS handler as usual.
-DOWNLOAD_HANDLERS = {
-    'http':  'scrapy_impersonate.ImpersonateDownloadHandler',
-    'https': 'scrapy_impersonate.ImpersonateDownloadHandler',
-}
+# TLS fingerprint spoofing is handled by framework TlsClientDownloaderMiddleware,
+# wired in each spider's custom_settings['DOWNLOADER_MIDDLEWARES'] and activated
+# per-Request via meta['use_tls_middleware']=True. Do NOT set DOWNLOAD_HANDLERS
+# here for scrapy-impersonate (it's not in the scrapyd container — Appendix A4).

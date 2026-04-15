@@ -18,9 +18,11 @@
 #       for meal in ...:
 #           yield MealItem(...)
 #
-# TLS fingerprint impersonation: set self.IMPERSONATE (e.g. 'chrome110') and
-# include meta['impersonate'] = self.IMPERSONATE in every yielded Request. The
-# settings.py DOWNLOAD_HANDLERS routes those through scrapy-impersonate (curl_cffi).
+# TLS fingerprint impersonation (ConSo standard — Invariant I7): set
+# self.USE_TLS = True and include meta['use_tls_middleware'] = True in every
+# yielded Request. The framework TlsClientDownloaderMiddleware @ 301 (declared
+# in custom_settings below) handles it. DO NOT install scrapy-impersonate and
+# DO NOT write a project-local curl_cffi wrapper.
 
 import scrapy
 import logging
@@ -33,8 +35,9 @@ class ConSoOutletDetail(BaseSpider):
     name = "conso_outlet_detail"
     id_platform = "{{ID_PLATFORM}}"
 
-    # Optional TLS fingerprint profile (curl_cffi). Leave None if not needed.
-    IMPERSONATE = None   # e.g. 'chrome110'
+    # Set True if the platform blocks default Scrapy TLS fingerprint.
+    # Must match the finder spider's USE_TLS if both exist.
+    USE_TLS = False
 
     custom_settings = {
         "ITEM_PIPELINES": {
@@ -43,7 +46,15 @@ class ConSoOutletDetail(BaseSpider):
             # 'dashmote_sourcing.pipelines.mongodb_pipeline.MongoDBPipeline': 400, # for testing
         },
         "DOWNLOADER_MIDDLEWARES": {
+            # ConSo standard stack — framework classes only (Invariant I7).
+            # Uncomment StaticProxyMiddleware + TlsClientDownloaderMiddleware if USE_TLS = True
+            # or the platform needs proxying. See DLR / TKW / YDE for reference.
+            # 'dashmote_sourcing.middlewares.proxy_middleware.StaticProxyMiddleware': 300,
+            # 'dashmote_sourcing.middlewares.tlsclient_middleware.TlsClientDownloaderMiddleware': 301,
             'dashmote_sourcing.middlewares.monitor_middleware.PrometheusMiddleware': 543,
+            # Disable these when TlsClientDownloaderMiddleware is enabled (it handles them itself):
+            # 'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': None,
+            # 'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
         },
         "LOG_LEVEL": "INFO",
         "CONCURRENT_REQUESTS": 16,
@@ -137,8 +148,8 @@ class ConSoOutletDetail(BaseSpider):
                 # For multi-request flows (catalog→menu→options), yield the first
                 # Request here and chain the rest inside parse callbacks using meta.
                 meta = {"id_outlet": id_outlet, "outlet_data": outlet_data}
-                if self.IMPERSONATE:
-                    meta['impersonate'] = self.IMPERSONATE
+                if self.USE_TLS:
+                    meta['use_tls_middleware'] = True
                 yield scrapy.Request(
                     url=...,
                     callback=self.parse,
