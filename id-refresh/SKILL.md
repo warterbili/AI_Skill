@@ -17,7 +17,11 @@ Two execution modes:
 | Mode | Redis | S3 bucket | Runs spider | Best for |
 |---|---|---|---|---|
 | **Local** | test (`db/redis/test`) | `dash-alpha-dev` | your machine (`scrapy crawl … -a local_test=True`) | small batches (<500 IDs), debugging, dry-run before prod |
-| **Fargate** | prod (`db/redis/prod`) | `dash-sourcing` | ECS Fargate (shares image + Phase 3-5 with `/run-detail`) | large batches (≥500 IDs), direct-to-prod data fixes, no local setup |
+| **Fargate** | prod (`db/redis/prod`) | `dash-alpha-dev` | ECS Fargate (shares image + Phase 3-5 with `/run-detail`) | large batches (≥500 IDs), direct-to-prod data fixes, no local setup |
+
+> **Note:** Both modes share the same bucket `dash-alpha-dev`; paths differ by prefix.
+> Fargate writes to `sourcing/{PLATFORM}/{month}/` (prod path — same as monthly cron).
+> The legacy bucket name `dash-sourcing` does not exist (A12 2026-04-17).
 
 ---
 
@@ -210,8 +214,8 @@ After mode is chosen, resolve:
 | Variable | Local mode | Fargate mode |
 |---|---|---|
 | `REDIS_SECRET` | `db/redis/test` | `db/redis/prod` |
-| `S3_BUCKET` | `dash-alpha-dev` | `dash-sourcing` |
-| `S3_PREFIX_TMPL` | `sourcing/{platform}/{month}/` | `{platform}/{month}/` |
+| `S3_BUCKET` | `dash-alpha-dev` | `dash-alpha-dev` |
+| `S3_PREFIX_TMPL` | `sourcing/{platform}/{month}/` | `sourcing/{platform}/{month}/` |
 | Spider invocation | `scrapy crawl conso_outlet_detail -a local_test=True …` (on your machine) | `aws ecs run-task …` (via run-detail Phase 3-5) |
 | `id_refresh` arg | `False` | `False` |
 | `recrawl` arg | `False` | `False` |
@@ -251,7 +255,7 @@ fi
   MEAL_FIX:          False
   REDIS_SECRET:      db/redis/prod    (← Fargate)
   REDIS_KEY:         TKW:NL:202603:outlet_feeds
-  S3_BUCKET:         dash-sourcing    (← Fargate)
+  S3_BUCKET:         dash-alpha-dev   (← Fargate; prefix=sourcing/{PLATFORM}/{month}/)
   SPIDER_PROJECT_DIR: (N/A — Fargate mode)
   TRIGGER_QA_SCRIPT: /home/user/.claude/skills/trigger-qa/scripts/trigger_qa_pipeline.py
 ```
@@ -336,7 +340,7 @@ echo "Retry CSV written to /tmp/id-refresh-retry.csv (N=$(wc -l < /tmp/id-refres
 | **I1** | `COUNTRY` ≡ MySQL table name ≡ Redis key country segment ≡ S3 partition prefix | Steps 1, 2, 4, 7 | Queries hit wrong table / wrong partition / empty results |
 | **I2** | `id_outlet` in CSV ≡ `id_outlet` PK in MySQL ≡ Redis SADD value ≡ row key in S3 parquet | Steps 1-4, 7 | Orphan IDs: in Redis but not MySQL → silently skipped by spider |
 | **I3** | `MODE=local` ⇔ `REDIS_SECRET=db/redis/test` ⇔ `S3_BUCKET=dash-alpha-dev` ⇔ spider has `-a local_test=True` | Phase 0, Steps 2/3/4 | Cross-contamination: push to test Redis, spider reads prod → empty run |
-| **I4** | `MODE=fargate` ⇔ `REDIS_SECRET=db/redis/prod` ⇔ `S3_BUCKET=dash-sourcing` ⇔ spider runs WITHOUT `local_test` | Phase 0, Steps 2/3/4 | Writes appear in wrong bucket; QA finds nothing |
+| **I4** | `MODE=fargate` ⇔ `REDIS_SECRET=db/redis/prod` ⇔ `S3_BUCKET=dash-alpha-dev` (with prefix `sourcing/{PLATFORM}/...`) ⇔ spider runs WITHOUT `local_test`. **`dash-sourcing` bucket does not exist** — legacy name, Incident A12 | Phase 0, Steps 2/3/4 | Writes appear in wrong path; verify step gets NoSuchBucket on `dash-sourcing` |
 | **I5** | Spider always runs with `id_refresh=False` AND `recrawl=False` (in BOTH modes) | Step 3 | `id_refresh=True` would overwrite our manually pushed Redis queue; `recrawl=True` would filter out "already crawled" IDs (defeats the purpose) |
 | **I6** | `REDIS_KEY` pattern = `{platform}:{country}:{output_month}:outlet_feeds` — same as monthly cron (Fargate mode) | Step 2 | Race with prod cron → partial pushes / duplicates |
 | **I7** | Metadata completeness: ≥95% of CSV IDs have non-NULL `unique_name` in MySQL | Step 1, Pre-launch Gate | Spider silently skips every ID missing metadata → S3 output dramatically smaller than expected |
@@ -507,7 +511,7 @@ if [[ "$MODE" == "local" ]]; then
     [[ "$REDIS_SECRET" == "db/redis/test" && "$S3_BUCKET" == "dash-alpha-dev" ]] \
         || { echo "❌ G5 FAIL: local mode but wrong endpoints"; exit 1; }
 elif [[ "$MODE" == "fargate" ]]; then
-    [[ "$REDIS_SECRET" == "db/redis/prod" && "$S3_BUCKET" == "dash-sourcing" ]] \
+    [[ "$REDIS_SECRET" == "db/redis/prod" && "$S3_BUCKET" == "dash-alpha-dev" ]] \
         || { echo "❌ G5 FAIL: fargate mode but wrong endpoints"; exit 1; }
 fi
 ```
@@ -919,7 +923,8 @@ safe against injection via CSV content or country arg.
   - Fargate mode: `db/redis/prod` (SSL).
 - **S3 paths**:
   - Local: `s3://dash-alpha-dev/sourcing/{platform}/{output_month}/{country}_{table}/id_job={YYYYMMDD}/`
-  - Fargate: `s3://dash-sourcing/{platform}/{output_month}/{country}_{table}/id_job={YYYYMMDD}/`
+  - Fargate: `s3://dash-alpha-dev/sourcing/{platform}/{output_month}/{country}_{table}/id_job={YYYYMMDD}/`
+  - Both modes share the bucket `dash-alpha-dev`; `dash-sourcing` is a non-existent legacy name (A12 2026-04-17).
 - **Large batches**: Local >3000 IDs can take multiple hours. Consider Fargate
   — container can run headless and you can close your laptop.
 - **Race with monthly cron (Fargate only)**: The Redis key is shared. Either:

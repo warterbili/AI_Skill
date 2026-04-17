@@ -117,7 +117,7 @@ that touches an invariant, verify the fields match Phase 0's resolved table.
 | **I2** | `SERVICE_NAME=conso-outlet-detail` ≡ task-def `family` ≡ Loki `service` label | Phase 4.1, 5.1 overrides, 6.2 query | Phase 6 log query returns empty — "my task ran but there are no logs" |
 | **I3** | `IMAGE_DIGEST` captured in Phase 3.1 ≡ image in Phase 4.1 registered task-def ≡ image running in Fargate | Phase 3.1 → 4.1 → 5.1 | Validated one image, ran a different one (race with concurrent `:latest` push) |
 | **I4** | `ID_PLATFORM` env ≡ container env ≡ S3 path prefix ≡ MySQL DB name | Phase 5.1 overrides, 7.1, 7.2 | Data writes to wrong DB/bucket; QA shows "no data" but it exists under the wrong key (YDE/LMN-class) |
-| **I5** | `sample=0` confirmed by user → writes to `s3://dash-sourcing/…` (PROD); `sample>0` → writes to `s3://dash-alpha-dev/sample/…` (DEV) | Phase 2 Q5, Phase 4.5 G5, Phase 7.1 | Accidentally pushing test data to prod bucket (or worse, prod data to test) |
+| **I5** | All modes write to the same bucket `dash-alpha-dev`; the path prefix distinguishes PROD vs DEV. `sample=0` → `s3://dash-alpha-dev/sourcing/{PLATFORM}/…` (PROD); `sample>0` → `s3://dash-alpha-dev/sourcing/sample/{PLATFORM}/…` (DEV). PLATFORM is **UPPERCASE** (DLR/TKW/IFD), NOT lowercase. **⚠️ The bucket `dash-sourcing` does NOT exist** — legacy doc name, HeadBucket returns 404 (Incident A12) | Phase 2 Q5, Phase 4.5 G5, Phase 7.1 | Accidentally pushing test data to prod path (or worse, prod data to test path); diagnostic commands targeting `s3://dash-sourcing/...` silently return 0 files |
 | **I6** | **Exactly ONE** task per `(platform, prefix, month)` has `id_refresh=True`; all workers are `id_refresh=False` | Phase 2 id_refresh table, 5.1, 5.1b | Multiple tasks try to populate Redis → queue state clash → duplicated/missed outlets |
 | **I7** | `AWS_ACCOUNT_ID` resolved in Phase 0 ≡ account MFA authenticated to ≡ account owning ECR/ECS/Subnets | Phase 0, 3.1, 4.1, 5.1 | Cross-account references → silently resolve to nothing, task launch fails with cryptic error |
 | **I8** | MySQL finder data exists AND is fresh for the target prefix | Phase 0.6 preflight, Phase 2 Q1 default | detail's `filter()` returns 0 outlets → task exits immediately with 0 items scraped, ~$2-5 wasted on Fargate startup |
@@ -951,7 +951,7 @@ ACTUAL_ACCT=$(aws sts get-caller-identity --query Account --output text \
 if [[ "${SAMPLE:-0}" == "0" ]]; then
     echo ""
     echo "⚠️  About to run in PRODUCTION mode (sample=0):"
-    echo "     Writes to prod S3: s3://dash-sourcing/$ID_PLATFORM_LOWER/$OUTPUT_MONTH/"
+    echo "     Writes to prod S3: s3://dash-alpha-dev/sourcing/$ID_PLATFORM/$OUTPUT_MONTH/"
     echo "     Writes to prod MySQL"
     echo "     Tasks: $INSTANCE_COUNT (running for hours)"
     echo ""
@@ -1443,15 +1443,16 @@ If log count and store count diverge, narrate the gap loudly.
 ### 7.1 — Count files in S3 (primary destination)
 
 ```bash
-# Confirm bucket + path convention on first run; store as constant after.
-#   Production: s3://dash-sourcing/<ID_PLATFORM_LOWER>/<OUTPUT_MONTH>/<PREFIX>/
-#   Test (sample>0): s3://dash-alpha-dev/sample/<ID_PLATFORM_LOWER>/<OUTPUT_MONTH>/<PREFIX>/
+# Both prod and sample share the SAME bucket dash-alpha-dev — the path prefix
+# distinguishes them (Invariant I5, Incident A12 2026-04-17).
+#   Production:      s3://dash-alpha-dev/sourcing/<ID_PLATFORM>/<OUTPUT_MONTH>/<PREFIX>/
+#   Test (sample>0): s3://dash-alpha-dev/sourcing/sample/<ID_PLATFORM>/<OUTPUT_MONTH>/<PREFIX>/
+# PLATFORM uses UPPERCASE (DLR/TKW/IFD); `dash-sourcing` bucket does NOT exist.
+S3_BUCKET="dash-alpha-dev"
 if [[ "${SAMPLE:-0}" -gt 0 ]]; then
-    S3_BUCKET="dash-alpha-dev"
-    S3_PREFIX="sample/${ID_PLATFORM_LOWER}/${OUTPUT_MONTH}/${PREFIX}/"
+    S3_PREFIX="sourcing/sample/${ID_PLATFORM}/${OUTPUT_MONTH}/${PREFIX}/"
 else
-    S3_BUCKET="dash-sourcing"   # confirm on first run
-    S3_PREFIX="${ID_PLATFORM_LOWER}/${OUTPUT_MONTH}/${PREFIX}/"
+    S3_PREFIX="sourcing/${ID_PLATFORM}/${OUTPUT_MONTH}/${PREFIX}/"
 fi
 
 echo "🪣 Listing s3://${S3_BUCKET}/${S3_PREFIX}"

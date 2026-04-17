@@ -2,11 +2,15 @@
 """Push outlet IDs to Redis and verify S3 output for targeted re-crawls.
 
 Supports two modes:
-  * local   — test Redis (db/redis/test) + test bucket (dash-alpha-dev). Run spider
-              locally with `-a local_test=True`. Small-batch / debugging.
-  * fargate — prod Redis (db/redis/prod) + prod bucket (dash-sourcing). Spider
-              runs inside Fargate container (launched via run-detail's Phase 3-5).
-              Large batches, direct-to-prod data fixes.
+  * local   — test Redis (db/redis/test) + bucket dash-alpha-dev (path `sourcing/{PLATFORM}/...`).
+              Run spider locally with `-a local_test=True`. Small-batch / debugging.
+  * fargate — prod Redis (db/redis/prod) + bucket dash-alpha-dev (path `sourcing/{PLATFORM}/...`,
+              same as monthly cron). Spider runs inside Fargate container
+              (launched via run-detail's Phase 3-5). Large batches, direct-to-prod data fixes.
+
+Both modes share the same S3 bucket (`dash-alpha-dev`); they differ only in which
+Redis instance is addressed. The bucket `dash-sourcing` does NOT exist — legacy
+name from pre-unification docs, Incident A12 (2026-04-17).
 
 All subcommands accept `--mode local|fargate`. Mode determines which secret the
 Redis client fetches and which S3 bucket verify reads.
@@ -79,8 +83,8 @@ MODE_CONFIG = {
     },
     "fargate": {
         "redis_secret": "db/redis/prod",
-        "s3_bucket":    "dash-sourcing",
-        "s3_prefix":    "{platform}/{output_month}/",
+        "s3_bucket":    "dash-alpha-dev",
+        "s3_prefix":    "sourcing/{platform}/{output_month}/",
         "redis_ssl":    True,
     },
 }
@@ -489,8 +493,8 @@ def cmd_verify_ids(args: argparse.Namespace) -> None:
 def _add_mode(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mode", required=True, choices=list(MODE_CONFIG),
-        help="local = test Redis + test S3 bucket (dash-alpha-dev); "
-             "fargate = prod Redis + prod S3 bucket (dash-sourcing).",
+        help="local = test Redis + bucket dash-alpha-dev (sourcing/{PLATFORM}/...); "
+             "fargate = prod Redis + SAME bucket dash-alpha-dev (same path as monthly cron).",
     )
 
 
