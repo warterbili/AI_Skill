@@ -657,6 +657,78 @@ Proceed? (Y/n)
 
 ---
 
+## Phase 2.5 — Spider Code Change Validation (conditional)
+
+**⛔ 适用场景：本次 run-detail 是为了验证刚改过的 spider 代码（bug fix / 防御写法 / middleware 改动等）。**
+
+如果你最近修改了 `<platform>/spiders/conso_outlet_*.py` 或相关 middleware/pipeline，
+**直接 push 到 spider repo 等 CI build 再跑 Fargate 的"天真流程"会浪费 10 分钟 - 8 小时**
+（见 T34, 2026-04-17 JSE UK IndexError）。必须先做本地级联验证。
+
+### 决策树
+
+```
+问自己: 本次 run-detail 之前, 我/用户改过 spider 代码吗？
+├─ 没有  → 跳过 Phase 2.5, 进入 Phase 3
+└─ 有    → 必须走级联验证
+            ↓
+         改动类型？
+         ├─ 格式化/注释/typing 改动
+         │    → 必过级 2 (py_compile), 其他可跳, 进 Phase 3
+         │
+         ├─ 边界检查/防御写法 (e.g., records[0] if records)
+         │    → 必过级 2 + 级 3 (单元测试), 级 4 推荐, 进 Phase 3
+         │
+         ├─ start_requests / parse / 业务逻辑改动
+         │    → 必过级 2 + 3 + 4 (scrapy local_test=True), 进 Phase 3
+         │
+         ├─ middleware / pipeline / DOWNLOADER_MIDDLEWARES 配置改动
+         │    → 必过级 2 + 3 + 4 + 5 (Fargate sample=10),
+         │       级 5 不 PASS 不允许进 prod run
+         │
+         └─ Dockerfile / Python 依赖版本
+              → 必过级 2 + 5 (local 环境不代表容器环境)
+```
+
+### 级联验证简表
+
+| 级 | 动作 | 耗时 | 成本 | 抓什么 |
+|---|------|------|------|--------|
+| 1 | 读代码 + 对比已知正确写法（grep DLR/IFD/YDE 同位置） | 0s | $0 | 明显逻辑错 |
+| 2 | `python -m py_compile <spider>.py` | 1s | $0 | 语法/缩进/import |
+| 3 | Inline Python 单元测试（pandas-only，不连外部服务） | 5s | $0 | 逻辑 edge cases |
+| 4 | `scrapy crawl ... -a local_test=True` | 60s | $0 + VPN/MySQL | 真实 schema / pandas 版本 / middleware chain |
+| 5 | `/run-detail` 带 `sample=10` | 10min | ~$0.5 | 完整 Fargate 环境 / parquet / QATrigger |
+
+### Bot 的行为
+
+1. **在 Phase 2 Q5 (sample) 之后, Phase 3 之前**, bot 必须问自己上面决策树的问题
+2. **如果近期有 spider code 改动**, narrate 给用户："检测到 spider 代码改动 — 走 Phase 2.5 级联验证"
+3. **按改动类型确定必过级**, 跑对应级的命令
+4. **任一必过级 FAIL** → STOP, 回退改代码, 不进 Phase 3
+5. **全 PASS** → narrate "Phase 2.5 ✅ 全 PASS, 进 Phase 3"
+
+### 完整协议文档
+
+→ `prompts/spider_fix_protocol.md`（包括单元测试模板、失败回溯表、跳过指南）
+
+### 典型失误（T34 2026-04-17 JSE UK IndexError）
+
+**错误流程:** bot 识别出 `conso_outlet_detail.py:255` 的 IndexError → 直接写 diff →
+想立即 push → 被用户拦截。
+
+**正确流程（本 Phase 2.5）:**
+1. 改 line 255: `data = [0]` → `records = ...; if not records: continue; data = records[0]`
+2. 级 2: `python -m py_compile JSE/spiders/conso_outlet_detail.py` ✅
+3. 级 3: inline `python -c "import pandas as pd; df = ...; ..."` ✅（意外发现 int64 vs str 根因）
+4. 级 4: `timeout 90 scrapy crawl conso_outlet_detail -a prefix=UK -a local_test=True` ✅
+5. （业务逻辑改动, 级 5 可跳）
+6. Commit + push spider repo → CI build → /run-detail 重跑 UK
+
+**ROI**: 级联 ~10 秒反馈 vs 直接 push 10 分钟 - 8 小时才知道没修好。
+
+---
+
 ## Phase 3 — Image Validation (pre-run check)
 
 **Purpose:** Ensure the ECR image is up to date with the latest code before launching.
