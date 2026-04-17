@@ -121,7 +121,7 @@ that touches an invariant, verify the fields match Phase 0's resolved table.
 | **I6** | **Exactly ONE** task per `(platform, prefix, month)` has `id_refresh=True`; all workers are `id_refresh=False` | Phase 2 id_refresh table, 5.1, 5.1b | Multiple tasks try to populate Redis → queue state clash → duplicated/missed outlets |
 | **I7** | `AWS_ACCOUNT_ID` resolved in Phase 0 ≡ account MFA authenticated to ≡ account owning ECR/ECS/Subnets | Phase 0, 3.1, 4.1, 5.1 | Cross-account references → silently resolve to nothing, task launch fails with cryptic error |
 | **I8** | MySQL finder data exists AND is fresh for the target prefix | Phase 0.6 preflight, Phase 2 Q1 default | detail's `filter()` returns 0 outlets → task exits immediately with 0 items scraped, ~$2-5 wasted on Fargate startup |
-| **I9** | Task def `ggm_app.image` MUST contain `conso_{platform}_spider` for the platform being launched (**TASK-IMAGE**) | Phase 4.2 patch step | Spider loads wrong platform's code → wrong `id_platform` → CASS 404 → crash. **Incident A7 (JSE 2026-04-14):** shared task def was overwritten by IFD CI; JSE launched IFD's spider unknowingly |
+| **I9** | Task def container `$CONTAINER_NAME` (`conso_{platform}_spider`) `.image` MUST match the platform being launched (**TASK-IMAGE**). Do NOT patch/query a container named `ggm_app` — that was the legacy shared-task-def name and the current per-platform task defs no longer contain it | Phase 4.2 patch step, 4.5 G1 gate, Phase 1.2 exit-code extract | Spider loads wrong platform's code → wrong `id_platform` → CASS 404 → crash. **Incident A7 (JSE 2026-04-14):** shared task def was overwritten by IFD CI; JSE launched IFD's spider unknowingly. **Incident T34 (DLR 2026-04-17):** SKILL.md still referenced `ggm_app` → patches/queries silently no-op'd (task def would have launched with `:latest`, exit-code would have read as None) |
 
 **Rule of thumb:** after every AWS call, grep output for the invariant's fields
 and assert they match Phase 0. If an assertion fails, STOP and narrate — don't
@@ -440,13 +440,14 @@ aws ecs describe-tasks --cluster "$CLUSTER" --tasks $ALL_TASKS \
   | python3 -c "
 import sys, json
 platform = '${ID_PLATFORM}'
+container = '${CONTAINER_NAME}'   # conso_{platform}_spider — NOT legacy ggm_app (I9)
 data = json.load(sys.stdin)
 for t in data.get('tasks', []):
     for o in t.get('overrides', {}).get('containerOverrides', []):
         for e in o.get('environment', []):
             if e.get('name') == 'Platform' and e.get('value') == platform:
                 exit_code = next(
-                    (c.get('exitCode') for c in t.get('containers', []) if c.get('name') == 'ggm_app'),
+                    (c.get('exitCode') for c in t.get('containers', []) if c.get('name') == container),
                     None
                 )
                 print(json.dumps({
@@ -864,8 +865,10 @@ aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
   | python3 -c "
 import sys, json, os
 td = json.load(sys.stdin)['taskDefinition']
+# Patch the platform-specific spider container — NOT legacy 'ggm_app' (I9).
+# CONTAINER_NAME = conso_{platform}_spider, resolved in Phase 0.4.
 for c in td['containerDefinitions']:
-    if c['name'] == 'ggm_app':
+    if c['name'] == '${CONTAINER_NAME}':
         c['image'] = '${IMAGE_URI}'   # digest-pinned (I3)
 keep = ['family','taskRoleArn','executionRoleArn','networkMode','containerDefinitions',
         'volumes','placementConstraints','requiresCompatibilities','cpu','memory','runtimePlatform']
@@ -899,9 +902,12 @@ if [[ -z "$IMAGE_DIGEST" || "$IMAGE_DIGEST" == "null" ]]; then
     echo "❌ G1 FAIL: IMAGE_DIGEST not set — Phase 3.1 did not run correctly"
     exit 1
 fi
-# The task-def we just registered must contain this digest, not :latest
+# The task-def we just registered must contain this digest, not :latest.
+# Query the platform-specific container — NOT legacy 'ggm_app' (I9).
 REGISTERED_IMG=$(aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" \
-    --region "$AWS_REGION" --query 'taskDefinition.containerDefinitions[?name==`ggm_app`].image | [0]' --output text)
+    --region "$AWS_REGION" \
+    --query "taskDefinition.containerDefinitions[?name==\`${CONTAINER_NAME}\`].image | [0]" \
+    --output text)
 if [[ "$REGISTERED_IMG" != *"$IMAGE_DIGEST"* ]]; then
     echo "❌ G1 FAIL: task-def image ($REGISTERED_IMG) does not contain verified digest"
     exit 1
